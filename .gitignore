@@ -1,0 +1,19 @@
+# Output folders
+vcd_output/
+converted_output/
+
+# Output files (if placed elsewhere)
+*.vcd
+*.csv
+
+# Vivado project files
+*.xpr
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+
+# OS files
+.DS_Store
+Thumbs.db
