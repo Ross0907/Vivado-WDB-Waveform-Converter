@@ -6,6 +6,9 @@ converted_output/
 *.vcd
 *.csv
 
+# Personal notes/explanations
+EXPLANATION.md
+
 # Vivado project files
 *.xpr
 *.runs/

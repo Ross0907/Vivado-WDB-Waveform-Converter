@@ -4,28 +4,38 @@ Extract simulation waveform data from Xilinx Vivado XSim to VCD, CSV, JSON, or E
 
 ## Quick Start
 
+### 1. Generate VCD from Vivado
+
+In Vivado: `Tools` → `Run Tcl Script` → select `extract_waveform.tcl` (while simulation window is open)
+
 ```tcl
-# In Vivado: Tools → Run Tcl Script → select extract_waveform.tcl
 capture "all"          # For testbench (runs until $finish)
 capture "100us"        # For manual testing
 ```
+
+The VCD file is saved to `vcd_output/` next to the script.
+
+### 2. Convert VCD to Other Formats (Optional)
 
 ```bash
 python vcd_converter.py                      # GUI
 python vcd_converter.py waveform.vcd --json  # CLI
 ```
 
+![VCD Converter GUI](images/gui_screenshot.png)
+
 ## Requirements
 
 **Tcl Script:** Xilinx Vivado 2020.x+ with active XSim simulation
 
-**Python Converter:** Python 3.6+ (tkinter included). Optional: `pip install openpyxl` for Excel export.
+**Python Converter:** Python 3.6+ (tkinter included). Excel export auto-installs `openpyxl` on first use.
 
 ## Project Structure
 
 ```
 ├── extract_waveform.tcl    # Tcl script for Vivado XSim
-├── vcd_converter.py        # Python converter (GUI + CLI)
+├── vcd_converter.py        # Python converter (CLI + GUI)
+├── vcd_converter.pyw       # GUI only (double-click, no console window)
 ├── vcd_output/             # VCD files (auto-created)
 └── converted_output/       # CSV/JSON/Excel (auto-created)
 ```
@@ -49,15 +59,21 @@ python vcd_converter.py waveform.vcd --json  # CLI
 ### Python CLI
 
 ```
-python vcd_converter.py <input.vcd> [-o output] [--csv|--json|--excel] [--hex|--int|--bin] [--us|--ns|--ps]
+python vcd_converter.py <input.vcd> [-o output] [--csv|--json|--excel] [--hex|--int|--signed|--smag|--bin] [--us|--ns|--ps]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `-o <file>` | Output path |
 | `--csv/--json/--excel` | Output format (default: csv) |
-| `--hex/--int/--bin` | Value format (default: hex) |
+| `--hex` | Values as hexadecimal (default) |
+| `--int` | Values as unsigned integers |
+| `--signed` | Values as signed two's complement |
+| `--smag` | Values as signed magnitude |
+| `--bin` | Values as binary strings |
 | `--us/--ns/--ps` | Time unit (default: us) |
+
+> **Excel Graphing Tip:** Use `--int`, `--signed`, or `--smag` for Excel export if you want to create graphs. These formats store actual numbers. Hex and binary are stored as text (to preserve formatting like leading zeros) and cannot be graphed directly.
 
 ---
 
