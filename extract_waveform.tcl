@@ -1,9 +1,8 @@
 # Vivado XSim Waveform Extractor
 # Extracts simulation waveforms to VCD format
 # Usage: Tools -> Run Tcl Script -> select this file
-# Author: Ross | License: MIT
+# Author: Roshan Tripathy | License: MIT
 
-# ----- Configuration -----
 set ::script_dir [file dirname [info script]]
 set ::output_dir [file join $::script_dir "vcd_output"]
 set ::force_commands {}
@@ -12,9 +11,7 @@ set ::vcd_is_open 0
 set ::auto_log_file "waveform.vcd"
 
 proc ensure_output_dir {} {
-    if {![file exists $::output_dir]} {
-        file mkdir $::output_dir
-    }
+    if {![file exists $::output_dir]} { file mkdir $::output_dir }
 }
 
 proc outpath {filename} {
@@ -22,15 +19,12 @@ proc outpath {filename} {
     return [file join $::output_dir $filename]
 }
 
-# ----- Force Commands -----
 proc force {signal radix value} {
     lappend ::force_commands [list $signal $radix $value]
     add_force $signal -radix $radix [list $value 0ns]
 }
 
-proc clear_forces {} {
-    set ::force_commands {}
-}
+proc clear_forces {} { set ::force_commands {} }
 
 proc show_forces {} {
     if {[llength $::force_commands] == 0} {
@@ -50,7 +44,6 @@ proc replay_forces {} {
     }
 }
 
-# ----- Auto-Logging -----
 proc start_auto_log {{filename ""}} {
     if {$::vcd_is_open} { return }
     if {$filename eq ""} { set filename $::auto_log_file }
@@ -94,31 +87,25 @@ proc restart {args} {
     uplevel 1 _original_restart $args
 }
 
-# ----- Capture Function -----
 proc capture {{run_time "all"} {filename "waveform"}} {
     set vcd_file [outpath "${filename}.vcd"]
-    
     catch {restart}
     if {[llength $::force_commands] > 0} { replay_forces }
-    
     if {[catch {open_vcd $vcd_file} err]} {
         puts "ERROR: $err"
         return ""
     }
     catch {log_vcd *}
-    
     if {$run_time eq "all"} {
         catch {run -all}
     } else {
         catch {run $run_time}
     }
-    
     catch {close_vcd}
     puts "Saved: $vcd_file (ended at [current_time])"
     return $vcd_file
 }
 
-# ----- Utilities -----
 proc signals {} {
     set sigs [get_objects]
     foreach sig $sigs {
@@ -144,18 +131,7 @@ proc snapshot {{filename "snapshot.csv"}} {
 }
 
 proc help {} {
-    puts "
-Waveform Extractor Commands:
-  capture \"50us\"         - restart + capture for duration
-  capture \"all\"          - run until $finish
-  autolog on/off         - toggle auto-logging
-  stop_auto_log          - save current VCD
-  force /path hex FF     - force signal value
-  show_forces            - list forces
-  clear_forces           - clear forces
-  signals                - list all signals
-  snapshot               - export values to CSV
-"
+    puts "\nWaveform Extractor Commands:\n  capture \"50us\"         - restart + capture for duration\n  capture \"all\"          - run until $finish\n  autolog on/off         - toggle auto-logging\n  stop_auto_log          - save current VCD\n  force /path hex FF     - force signal value\n  show_forces            - list forces\n  clear_forces           - clear forces\n  signals                - list all signals\n  snapshot               - export values to CSV\n"
 }
 
 puts "Waveform Extractor loaded (auto-logging ON). Type 'help' for commands."

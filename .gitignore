@@ -1,24 +1,44 @@
-# Output folders
+# Converter output
 vcd_output/
 converted_output/
-
-# Output files (if placed elsewhere)
 *.vcd
+*.wdb
+*.wdbdecode.log
 *.csv
+*.json
+*.xlsx
+batch_conversion_report.txt
 
-# Personal notes/explanations
-EXPLANATION.md
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
 
-# Vivado project files
+# Vivado generated files
 *.xpr
 *.runs/
 *.cache/
 *.hw/
 *.ip_user_files/
 *.sim/
+*.jou
+*.log
 
-# OS files
+# Build output
+build/
+dist/
+*.spec
+
+# OS / editor files
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
 
-testing/
+# Standalone executable builder
+.exe-build-venv/
+release/
+VivadoWaveformConverter-v*-Windows-x64.zip
+_version_info.txt
+_version_check.txt
