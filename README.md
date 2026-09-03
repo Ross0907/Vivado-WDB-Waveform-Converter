@@ -1,14 +1,7 @@
-<!--
-PROJECT BANNER PLACEHOLDER
-
-Recommended file: images/banner.png
-
-After adding it, replace this comment with:
-
 <p align="center">
-  <img src="images/banner.png" alt="Vivado WDB Waveform Converter" width="900">
+  <img src="images/logo.svg" alt="Vivado WDB Waveform Converter" width="900">
 </p>
--->
+
 
 # Vivado WDB Waveform Converter
 
@@ -45,32 +38,18 @@ WDB/WCFG input defaults to **VCD**. VCD input defaults to **CSV**.
 - Mixed SystemVerilog/VHDL simulations
 - Background GUI conversion
 - CLI and GUI operation
-- Standalone Windows executable build
+- Standalone Windows executable
 
-<!--
-MAIN GUI SCREENSHOT PLACEHOLDER
+Get the latest release from [here](https://github.com/Ross0907/Vivado-WDB-Waveform-Converter/releases)
 
-Recommended file: images/gui-v2.png
+![Vivado WDB Waveform Converter GUI](images/mainwindow.png)
 
-After adding it:
-![Vivado WDB Waveform Converter GUI](images/gui-v2.png)
--->
 
 ## Windows standalone executable
 
 Run:
 
-    BUILD_WINDOWS_EXE.bat
-
-The builder creates a one-file Windows executable with Python, Tkinter and Excel support bundled inside it.
-
-Output:
-
-    release\VivadoWDBWaveformConverter-v2.0.1.exe
-
-Release archive:
-
-    VivadoWDBWaveformConverter-v2.0.1-Windows-x64.zip
+    VivadoWDBWaveformConverter-v2.0.1.exe
 
 The target computer does not need Python installed.
 
@@ -124,15 +103,6 @@ Command-line example:
 
 The converter pairs WCFG files with WDB files only when the mapping is unambiguous.
 
-<!--
-BATCH CONVERSION SCREENSHOT PLACEHOLDER
-
-Recommended file: images/batch-conversion.png
-
-After adding it:
-![Batch conversion](images/batch-conversion.png)
--->
-
 ## Signal selection and radix
 
 List signals:
@@ -145,16 +115,13 @@ Filter signals:
 
 In the GUI, right-click one or more highlighted signals to select the radix. Available formats include binary, octal, hexadecimal, unsigned decimal, signed decimal and signed magnitude. `Default / WCFG` returns the signal to its WCFG/default setting.
 
+![Signal radix menu](images/signalselect.png)
+
 Radix affects CSV, JSON and Excel presentation. VCD remains standards-compliant and radix-neutral.
 
-<!--
-RADIX MENU SCREENSHOT PLACEHOLDER
 
-Recommended file: images/radix-menu.png
+![Signal radix menu](images/radix.png)
 
-After adding it:
-![Signal radix menu](images/radix-menu.png)
--->
 
 ## Native WDB reader
 
