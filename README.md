@@ -1,236 +1,228 @@
-# Vivado Waveform Converter
+<!--
+PROJECT BANNER PLACEHOLDER
 
-Vivado Waveform Converter is a waveform conversion and inspection utility for AMD Vivado/XSim simulation data.
+Recommended file: images/banner.png
 
-Version 2.0.0 adds direct WDB/WCFG support to the original VCD conversion workflow. Existing XSim waveform databases can be converted without reopening or rerunning the simulation in Vivado.
+After adding it, replace this comment with:
+
+<p align="center">
+  <img src="images/banner.png" alt="Vivado WDB Waveform Converter" width="900">
+</p>
+-->
+
+# Vivado WDB Waveform Converter
+
+Convert AMD Vivado/XSim **WDB and WCFG waveform databases directly to VCD, CSV, JSON and Excel** without rerunning the simulation.
+
+The converter also handles VCD-to-CSV/JSON/Excel workflows, batch conversion, signal filtering, per-signal radix selection, SystemVerilog and VHDL waveform types, and standalone Windows builds.
+
+## Supported conversions
+
+| Input | VCD | CSV | JSON | Excel |
+|---|:---:|:---:|:---:|:---:|
+| WDB | Yes | Yes | Yes | Yes |
+| WDB + WCFG | Yes | Yes | Yes | Yes |
+| WCFG | Yes | Yes | Yes | Yes |
+| VCD | - | Yes | Yes | Yes |
+
+WDB/WCFG input defaults to **VCD**. VCD input defaults to **CSV**.
 
 ## Features
 
-- WDB to VCD, CSV, JSON, or Excel
-- WDB + WCFG to VCD, CSV, JSON, or Excel
-- WCFG-only input when the referenced WDB can be resolved
-- VCD to CSV, JSON, or Excel
-- Windows GUI and command-line interface
-- Multi-file WDB/WCFG batch conversion
-- Per-signal radix selection from the signal-table right-click menu
-- WCFG-derived signal selection and radix defaults
-- SystemVerilog and VHDL waveform handling within the supported WDB profile
-- 0/1/X/Z states, real values, aliases, wide vectors, partial updates, arrays, records, and mixed-language designs
-- Structural validation of WDB/DBG/RTTI data before conversion
+- Native Vivado/XSim `.wdb` decoding
+- Optional `.wcfg` signal-selection and radix metadata
+- VCD, CSV, JSON and Excel export
+- Multiple-file batch conversion
+- Automatic unambiguous WDB/WCFG pairing
+- Full hierarchical signal names
+- Right-click per-signal radix selection
+- WCFG-derived radix defaults
+- Wide vectors and X/Z state preservation
+- SystemVerilog `real`
+- Packed and unpacked arrays
+- Multidimensional arrays
+- VHDL scalar, vector, array, record, integer, time and real types
+- Mixed SystemVerilog/VHDL simulations
+- Background GUI conversion
+- CLI and GUI operation
+- Standalone Windows executable build
 
-VCD-to-VCD conversion is intentionally omitted.
+<!--
+MAIN GUI SCREENSHOT PLACEHOLDER
 
-## Windows release
+Recommended file: images/gui-v2.png
 
-The standalone Windows executable is built from this repository with:
+After adding it:
+![Vivado WDB Waveform Converter GUI](images/gui-v2.png)
+-->
 
-```text
-BUILD_WINDOWS_EXE.bat
-```
+## Windows standalone executable
 
-The builder creates:
+Run:
 
-```text
-release\VivadoWaveformConverter-v2.0.0.exe
-VivadoWaveformConverter-v2.0.0-Windows-x64.zip
-```
+    BUILD_WINDOWS_EXE.bat
 
-The finished EXE bundles the Python runtime, Tkinter, and Excel support. Python is required only to build the executable, not to run it.
+The builder creates a one-file Windows executable with Python, Tkinter and Excel support bundled inside it.
 
-## Running from source
+Output:
 
-Python 3.10 or newer is required.
+    release\VivadoWDBWaveformConverter-v2.0.1.exe
 
-Install the optional Excel dependency:
+Release archive:
 
-```powershell
-py -3 -m pip install -r requirements.txt
-```
+    VivadoWDBWaveformConverter-v2.0.1-Windows-x64.zip
 
-Start the GUI:
+The target computer does not need Python installed.
 
-```powershell
-py -3 waveform_converter.py --gui
-```
+### Default output location
 
-Or double-click:
+When running the standalone executable, conversions are written by default to:
 
-```text
-waveform_converter.pyw
-```
+    <folder containing the EXE>\converted_output\
 
-## GUI usage
+The converter does not use the PyInstaller/AppData temporary extraction directory for user output.
 
-Source files load automatically after selection.
+When running directly from source, the default `converted_output` folder is beside `waveform_converter.py`.
 
-- WDB/WCFG input defaults to VCD output.
-- VCD input defaults to CSV output.
-- The signal table shows the signals selected for export.
-- Use **Select...** to change the selection.
-- Highlight one or more signals, right-click, and use **Radix** to change their table/export formatting.
-- **Default / WCFG** clears a per-signal radix override.
-- Decode and export operations run on background workers so the GUI remains responsive.
-- Successful conversion is reported in the status bar rather than a modal dialog.
+## Quick start
 
-Radix affects CSV, JSON, Excel, and the GUI table. Standard VCD does not define display-radix metadata, so VCD output remains radix-neutral.
+### WDB to VCD
+
+    python waveform_converter.py simulation.wdb
+
+or explicitly:
+
+    python waveform_converter.py simulation.wdb --vcd
+
+### WDB + WCFG
+
+    python waveform_converter.py simulation.wdb simulation.wcfg --vcd
+
+A WCFG can also be supplied directly when its associated WDB can be resolved:
+
+    python waveform_converter.py simulation.wcfg --vcd
+
+### Other formats
+
+    python waveform_converter.py simulation.wdb --csv
+    python waveform_converter.py simulation.wdb --json
+    python waveform_converter.py simulation.wdb --excel
+
+Existing VCD files:
+
+    python waveform_converter.py waveform.vcd --csv
+    python waveform_converter.py waveform.vcd --json
+    python waveform_converter.py waveform.vcd --excel
 
 ## Batch conversion
 
-The normal file selectors support multiple files.
+Multiple WDB and WCFG files can be selected at once from the GUI.
 
-- Select multiple WDB files in the Waveform browser.
-- Select matching WCFG files together when required.
-- Pairing uses the WCFG database reference first and matching filename stem second.
-- Ambiguous or unmatched WCFG pairings are rejected.
-- The first batch item is used for the signal-table preview.
-- The Output field becomes an output-folder field in batch mode.
-- A `batch_conversion_report.txt` file is written for each batch.
+Command-line example:
 
-CLI example:
+    python waveform_converter.py run1.wdb run1.wcfg run2.wdb run2.wcfg --vcd
 
-```powershell
-py -3 waveform_converter.py a.wdb a.wcfg b.wdb b.wcfg --vcd -o converted_output
-```
+The converter pairs WCFG files with WDB files only when the mapping is unambiguous.
 
-## Command line examples
+<!--
+BATCH CONVERSION SCREENSHOT PLACEHOLDER
 
-WDB to VCD using the default output format:
+Recommended file: images/batch-conversion.png
 
-```powershell
-py -3 waveform_converter.py simulation.wdb
-```
+After adding it:
+![Batch conversion](images/batch-conversion.png)
+-->
 
-WDB + WCFG to CSV:
+## Signal selection and radix
 
-```powershell
-py -3 waveform_converter.py simulation.wdb simulation.wcfg --csv
-```
+List signals:
 
-WCFG-only input:
+    python waveform_converter.py simulation.wdb --signals
 
-```powershell
-py -3 waveform_converter.py simulation.wcfg --json
-```
+Filter signals:
 
-VCD to CSV using the default output format:
+    python waveform_converter.py simulation.wdb --csv --include "*data*" --exclude "*internal*"
 
-```powershell
-py -3 waveform_converter.py waveform.vcd
-```
+In the GUI, right-click one or more highlighted signals to select the radix. Available formats include binary, octal, hexadecimal, unsigned decimal, signed decimal and signed magnitude. `Default / WCFG` returns the signal to its WCFG/default setting.
 
-Excel export:
+Radix affects CSV, JSON and Excel presentation. VCD remains standards-compliant and radix-neutral.
 
-```powershell
-py -3 waveform_converter.py waveform.vcd --excel --signed
-```
+<!--
+RADIX MENU SCREENSHOT PLACEHOLDER
 
-List WDB declarations:
+Recommended file: images/radix-menu.png
 
-```powershell
-py -3 waveform_converter.py simulation.wdb simulation.wcfg --signals
-```
+After adding it:
+![Signal radix menu](images/radix-menu.png)
+-->
 
-Export all stored WDB declarations instead of the WCFG selection:
+## Native WDB reader
 
-```powershell
-py -3 waveform_converter.py simulation.wdb simulation.wcfg --csv --all-stored
-```
+The characterized WDB profile currently targets databases containing:
 
-Per-signal radix rules:
+    Xilinx WAVE DATABASE 01
+    Xilinx ISim DBG 006
 
-```powershell
-py -3 waveform_converter.py simulation.wdb --csv ^
-  --radix "*counter*=unsigned" ^
-  --radix "*signed*=signed" ^
-  --radix "*opcode*=hex"
-```
+The reader uses embedded waveform event data, debug metadata and runtime type information. Unsupported or ambiguous structures are rejected instead of being guessed.
 
-Compact event-oriented JSON:
+See `WDB_FORMAT_NOTES.md` for format details.
 
-```powershell
-py -3 waveform_converter.py simulation.wdb --json --json-events
-```
+## Live Vivado VCD capture
 
-Common options:
+`extract_waveform.tcl` remains available for users who prefer live VCD recording from XSim.
 
-```text
---vcd / --csv / --json / --excel
---format vcd|csv|json|excel
--o PATH
---auto / --hex / --int / --signed / --bin / --oct / --smag
---radix PATTERN=RADIX
---fs / --ps / --ns / --us / --ms
---timescale 1ps
---signals
---include PATTERN
---exclude PATTERN
---primary-only
---all-stored
---json-events
---wcfg FILE
---gui
-```
+With an active simulation:
 
-`--timescale` applies to WDB/WCFG-to-VCD output. A coarser VCD timescale is rejected when recorded timestamps cannot be represented exactly.
+    Tools -> Run Tcl Script -> extract_waveform.tcl
 
-## WCFG behavior
+Direct WDB conversion does not require the Tcl helper and does not rerun the simulation.
 
-WCFG is optional configuration metadata; waveform samples remain in the WDB.
+## Running from source
 
-With WDB-only input, the converter obtains stored samples, signal names, hierarchy, widths, types, and aliases from the WDB and its embedded debug/type metadata.
+Python 3.10 or newer is recommended.
 
-When WCFG is supplied, it supplies initial signal selection and supported display metadata such as radix. WCFG data does not override exact WDB names or declared widths.
+Install dependencies:
 
-## WDB compatibility
+    python -m pip install -r requirements.txt
 
-The direct reader targets this format profile:
+Launch the GUI:
 
-```text
-Xilinx WAVE DATABASE 01
-Xilinx ISim DBG 006
-```
+    python waveform_converter.py
 
-The decoder validates the container, DBG/RTTI metadata, event pages, compressed chunks, runtime-bank mapping, widths/types, and aliases. Unsupported or ambiguous structures stop with a diagnostic instead of producing guessed waveform data.
+or:
 
-The WDB reader does not launch Vivado, rerun a testbench, or modify the input WDB/WCFG.
+    pythonw waveform_converter.pyw
 
-See `WDB_FORMAT_NOTES.md` for implementation details and format boundaries.
+## Project structure
 
-## Diagnostics
+    Vivado-WDB-Waveform-Converter/
+    |
+    |-- waveform_converter.py
+    |-- waveform_converter.pyw
+    |-- vcd_converter.py
+    |-- vcd_converter.pyw
+    |-- CONVERT_WAVEFORM.bat
+    |-- LIST_SIGNALS.bat
+    |-- BUILD_WINDOWS_EXE.bat
+    |-- extract_waveform.tcl
+    |-- WDB_FORMAT_NOTES.md
+    |-- CHANGELOG.md
+    |-- requirements.txt
+    |-- LICENSE
+    |
+    `-- images/
+        |-- README.md
+        |-- banner.png
+        |-- gui-v2.png
+        |-- radix-menu.png
+        `-- batch-conversion.png
 
-For WDB input the converter writes a diagnostic log beside the output:
+The image filenames above are placeholders for the current release screenshots.
 
-```text
-<output-file>.wdbdecode.log
-```
+## Legacy compatibility
 
-Keep this log when reporting an unsupported WDB or compatibility issue.
-
-## Live XSim capture
-
-`extract_waveform.tcl` remains available for simulations that are still running inside Vivado. It uses XSim's standard VCD logging commands and is independent of the direct WDB reader.
-
-## Compatibility entry points
-
-`vcd_converter.py` and `vcd_converter.pyw` are retained so existing VCD converter workflows continue to work through the unified engine.
-
-## Repository files
-
-```text
-waveform_converter.py        converter engine, CLI, and GUI
-waveform_converter.pyw       Python GUI launcher
-vcd_converter.py             compatibility CLI launcher
-vcd_converter.pyw            compatibility GUI launcher
-CONVERT_WAVEFORM.bat         Windows script/drag-and-drop launcher
-LIST_SIGNALS.bat             Windows signal-list helper
-BUILD_WINDOWS_EXE.bat        standalone Windows EXE builder
-extract_waveform.tcl         optional live XSim capture helper
-WDB_FORMAT_NOTES.md          WDB/DBG/RTTI format documentation
-requirements.txt             Excel export dependency
-CHANGELOG.md                 release history
-LICENSE                      MIT license
-```
+The original `vcd_converter.py` and `vcd_converter.pyw` entry points remain available for existing VCD conversion workflows.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT License. See `LICENSE`.

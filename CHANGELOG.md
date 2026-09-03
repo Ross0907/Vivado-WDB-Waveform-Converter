@@ -1,14 +1,17 @@
 # Changelog
 
-## 2.0.0 - 2026-09-03
+## 2.0.1
 
-- Added direct Vivado/XSim WDB decoding.
-- Added optional WCFG signal selection and radix defaults.
-- Added WDB/WCFG export to VCD, CSV, JSON, and Excel.
-- Added SystemVerilog and VHDL real-value, wide-vector, alias, partial-update, array, record, and mixed-language handling.
-- Added responsive background loading and export in the GUI.
-- Added right-click per-signal radix selection.
-- Added deterministic multi-file WDB/WCFG batch conversion and batch reports.
-- Added strict rejection of incompatible or ambiguous WDB structures.
-- Added a Windows builder for a self-contained one-file executable.
-- Retained `vcd_converter.py` and `vcd_converter.pyw` as compatibility entry points.
+- Use a persistent `converted_output` directory beside the standalone Windows executable instead of the PyInstaller temporary extraction directory.
+- Update project branding to Vivado WDB Waveform Converter.
+- Update repository documentation and image placeholders for the current GUI and batch workflow.
+
+## 2.0.0
+
+- Add direct Vivado/XSim WDB decoding.
+- Add optional WCFG selection and radix integration.
+- Add WDB/WCFG export to VCD, CSV, JSON and Excel.
+- Add batch WDB/WCFG processing.
+- Add right-click per-signal radix controls.
+- Add SystemVerilog, VHDL and mixed-language waveform support for characterized types.
+- Add standalone Windows executable build support.

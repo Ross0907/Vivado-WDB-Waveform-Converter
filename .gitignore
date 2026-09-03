@@ -39,6 +39,6 @@ Thumbs.db
 # Standalone executable builder
 .exe-build-venv/
 release/
-VivadoWaveformConverter-v*-Windows-x64.zip
+VivadoWDBWaveformConverter-v*-Windows-x64.zip
 _version_info.txt
 _version_check.txt
