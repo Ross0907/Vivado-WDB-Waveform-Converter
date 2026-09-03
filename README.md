@@ -7,7 +7,7 @@
 
 Convert AMD Vivado/XSim **WDB and WCFG waveform databases directly to VCD, CSV, JSON and Excel** without rerunning the simulation.
 
-The converter also handles VCD-to-CSV/JSON/Excel workflows, batch conversion, signal filtering, per-signal radix selection, SystemVerilog and VHDL waveform types, and standalone Windows builds.
+The converter also handles **VCD-to-CSV/JSON/Excel workflows, batch conversion, signal filtering, per-signal radix selection, SystemVerilog and VHDL waveform types**.
 
 ## Supported conversions
 
@@ -38,28 +38,50 @@ WDB/WCFG input defaults to **VCD**. VCD input defaults to **CSV**.
 - Mixed SystemVerilog/VHDL simulations
 - Background GUI conversion
 - CLI and GUI operation
-- Standalone Windows executable
+- Standalone builds for Windows, Linux and macOS
 
-Get the latest release from [here](https://github.com/Ross0907/Vivado-WDB-Waveform-Converter/releases)
+Get the latest release from [here](https://github.com/Ross0907/Vivado-WDB-Waveform-Converter/releases).
 
 ![Vivado WDB Waveform Converter GUI](images/mainwindow.png)
 
 
-## Windows standalone executable
+## Standalone applications
 
-Run:
+Prebuilt standalone applications are available from the GitHub Releases page.
 
-    VivadoWDBWaveformConverter-v2.0.1.exe
+### Windows x64
 
-The target computer does not need Python installed.
+    VivadoWDBWaveformConverter-v2.0.1-Windows-x64.exe
+
+### Linux x64
+
+    VivadoWDBWaveformConverter-v2.0.1-Linux-x64
+
+### Linux ARM64
+
+    VivadoWDBWaveformConverter-v2.0.1-Linux-arm64
+
+Linux builds may need the executable bit set after downloading:
+
+    chmod +x VivadoWDBWaveformConverter-v2.0.1-Linux-x64
+
+### macOS Intel
+
+    VivadoWDBWaveformConverter-v2.0.1-macOS-Intel.dmg
+
+### macOS Apple Silicon
+
+    VivadoWDBWaveformConverter-v2.0.1-macOS-AppleSilicon.dmg
+
+The standalone applications include the required Python runtime and dependencies, so Python does not need to be installed on the target system.
+
+Matching SHA-256 checksum files are provided with the release binaries.
 
 ### Default output location
 
-When running the standalone executable, conversions are written by default to:
+When running a standalone build, conversions are written by default to:
 
-    <folder containing the EXE>\converted_output\
-
-The converter does not use the PyInstaller/AppData temporary extraction directory for user output.
+    <folder containing the application>\converted_output\
 
 When running directly from source, the default `converted_output` folder is beside `waveform_converter.py`.
 
@@ -115,10 +137,9 @@ Filter signals:
 
 In the GUI, right-click one or more highlighted signals to select the radix. Available formats include binary, octal, hexadecimal, unsigned decimal, signed decimal and signed magnitude. `Default / WCFG` returns the signal to its WCFG/default setting.
 
-![Signal radix menu](images/signalselect.png)
+![Signal selection](images/signalselect.png)
 
 Radix affects CSV, JSON and Excel presentation. VCD remains standards-compliant and radix-neutral.
-
 
 ![Signal radix menu](images/radix.png)
 
@@ -160,6 +181,36 @@ or:
 
     pythonw waveform_converter.pyw
 
+## Building release binaries
+
+Multi-platform release builds are handled by GitHub Actions using native runners for each supported operating system and architecture.
+
+The workflow builds and uploads standalone release files for:
+
+- Windows x64
+- Linux x64
+- Linux ARM64
+- macOS Intel
+- macOS Apple Silicon
+
+The workflow is located at:
+
+    .github/workflows/build-multiplatform-release.yml
+
+It can be started from the GitHub Actions page, or from PowerShell using:
+
+    .\BUILD_MULTIPLATFORM_RELEASE.ps1
+
+For example:
+
+    .\BUILD_MULTIPLATFORM_RELEASE.ps1 -ReleaseTag v2.0.1
+
+The build helper triggers the workflow, waits for all platform builds to complete and verifies that the expected release assets were uploaded.
+
+The existing Windows-only local builder is also available:
+
+    BUILD_WINDOWS_EXE.bat
+
 ## Project structure
 
     Vivado-WDB-Waveform-Converter/
@@ -171,20 +222,22 @@ or:
     |-- CONVERT_WAVEFORM.bat
     |-- LIST_SIGNALS.bat
     |-- BUILD_WINDOWS_EXE.bat
+    |-- BUILD_MULTIPLATFORM_RELEASE.ps1
     |-- extract_waveform.tcl
     |-- WDB_FORMAT_NOTES.md
     |-- CHANGELOG.md
     |-- requirements.txt
     |-- LICENSE
     |
+    |-- .github/
+    |   `-- workflows/
+    |       `-- build-multiplatform-release.yml
+    |
     `-- images/
-        |-- README.md
-        |-- banner.png
-        |-- gui-v2.png
-        |-- radix-menu.png
-        `-- batch-conversion.png
-
-The image filenames above are placeholders for the current release screenshots.
+        |-- logo.svg
+        |-- mainwindow.png
+        |-- signalselect.png
+        `-- radix.png
 
 ## Legacy compatibility
 
