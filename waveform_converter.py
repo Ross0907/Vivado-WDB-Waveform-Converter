@@ -39,7 +39,7 @@ try:
 except ImportError:
     HAS_TK = False
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 WDB_MAGIC = b"Xilinx WAVE DATABASE 01\x00"
 DBG_MAGIC = b"Xilinx ISim DBG 006\x00"
@@ -74,6 +74,12 @@ def u64(b: bytes, off: int) -> int:
     if off < 0 or off + 8 > len(b):
         raise DecodeError(f"u64 outside file at 0x{off:X}")
     return struct.unpack_from("<Q", b, off)[0]
+
+
+def _s32(value: int) -> int:
+    """Interpret one stored u32 as a signed two's-complement integer."""
+    value &= 0xFFFFFFFF
+    return value - 0x100000000 if value & 0x80000000 else value
 
 
 def is_power_of_two(x: int) -> bool:
@@ -165,7 +171,8 @@ class DbgRange:
 
     @property
     def left(self) -> int:
-        return int(self.words[0])
+        # VHDL array bounds are signed 32-bit values in DBG 006.
+        return _s32(self.words[0])
 
     @property
     def step(self) -> int:
@@ -258,11 +265,10 @@ class DbgObject:
             # byte count in the object width field (record_v: 5 data bytes -> 8).
             return max(1, self.width)
         if kind == "vhdl_array":
-            shape = self.vhdl_array_leaf_shape
-            if shape is None:
-                raise DecodeError(f"VHDL array {self.path} has no leaf shape")
-            leaves, _leaf_type, _leaf_width, leaf_payload, _dims = shape
-            return len(leaves) * leaf_payload
+            # For VHDL aggregates DBG 006 reports the padded runtime storage
+            # byte count in the object width field. Recursive leaf layout is
+            # validated after the event stream has been mapped.
+            return max(1, self.width)
         if kind == "sv_unpacked_array":
             shape = self.unpacked_leaf_shape
             if shape is None:
@@ -713,13 +719,13 @@ def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
                         break
                     franges: list[tuple[int, int, int]] = []
                     for _r in range(rcount):
-                        left, right, step_raw = struct.unpack_from("<3I", tail, cur)
+                        left_raw, right_raw, step_raw = struct.unpack_from("<3I", tail, cur)
                         cur += 12
                         step = -1 if step_raw == 0xFFFFFFFF else int(step_raw)
                         if step not in {-1, 1}:
                             ok = False
                             break
-                        franges.append((int(left), int(right), step))
+                        franges.append((_s32(left_raw), _s32(right_raw), step))
                     if not ok:
                         break
                     fields.append(RttiField(fname, int(ftype), tuple(franges)))
@@ -2113,37 +2119,245 @@ def _triplet_range_count(r: tuple[int, int, int]) -> int:
     raise DecodeError(f"invalid VHDL RTTI range ({left},{right},{step})")
 
 
-def _vhdl_record_field_spec(field: RttiField, types: list[RttiType]) -> tuple[RttiType, int, int, bool, int | None, int | None]:
-    """Return (type,width,payload_bytes,is_real,left,right) for a record field."""
-    if field.type_index >= len(types):
-        raise DecodeError(f"VHDL record field {field.name!r} has invalid type index {field.type_index}")
-    t = types[field.type_index]
-    if t.kind in {"vhdl_vector", "vhdl_bit_vector"}:
-        if not field.ranges:
-            raise DecodeError(f"VHDL record vector field {field.name!r} has no concrete range")
-        width = 1
-        for r in field.ranges:
-            width *= _triplet_range_count(r)
-        left, right, _step = field.ranges[0]
-        return t, width, width, False, left, right
-    if field.ranges:
-        raise DecodeError(
-            f"VHDL record scalar field {field.name!r}/{t.kind} unexpectedly has range metadata"
+@dataclass(frozen=True)
+class VhdlLeafLayout:
+    suffix: str
+    type_info: RttiType
+    offset: int
+    payload_bytes: int
+    width: int
+    range_left: int | None = None
+    range_right: int | None = None
+
+
+@dataclass(frozen=True)
+class VhdlAggregateLayout:
+    size: int
+    alignment: int
+    leaves: tuple[VhdlLeafLayout, ...]
+
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0 or not is_power_of_two(alignment):
+        raise DecodeError(f"invalid VHDL aggregate alignment {alignment}")
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def _dbg_range_right(r: DbgRange) -> int:
+    return r.left + r.step * (r.count - 1)
+
+
+def _vhdl_layout_type(
+    type_info: RttiType,
+    types: list[RttiType],
+    ranges: tuple[DbgRange, ...],
+    cursor: int,
+    suffix: str,
+    stack: tuple[int, ...] = (),
+) -> tuple[int, int, list[VhdlLeafLayout], int]:
+    """Return (size, alignment, leaves, next-range-index) for one VHDL type.
+
+    XSim DBG 006 stores VHDL records with natural native alignment: 1-byte
+    scalar/enumeration data, 4-byte INTEGER alignment, and 8-byte TIME/REAL
+    alignment. Arrays store padded elements contiguously in declaration order.
+    Concrete array/vector ranges are supplied by the DBG object range stream.
+    """
+    if type_info.index in stack:
+        raise DecodeError(f"cyclic VHDL aggregate RTTI at type {type_info.index}")
+    stack = stack + (type_info.index,)
+    kind = type_info.kind
+
+    if kind in {"vhdl_logic", "vhdl_bit", "vhdl_boolean"}:
+        return 1, 1, [VhdlLeafLayout(suffix, type_info, 0, 1, 1)], cursor
+
+    if kind == "vhdl_enum":
+        if not type_info.enum_literals:
+            raise DecodeError(f"VHDL enumeration {type_info.name!r} has no literal table")
+        width = max(1, (len(type_info.enum_literals) - 1).bit_length())
+        return 1, 1, [VhdlLeafLayout(suffix, type_info, 0, 1, width)], cursor
+
+    if kind in {"vhdl_vector", "vhdl_bit_vector"}:
+        if cursor >= len(ranges):
+            raise DecodeError(f"VHDL vector {type_info.name!r} has no concrete DBG range")
+        r = ranges[cursor]
+        if r.count <= 0:
+            raise DecodeError(f"VHDL vector {type_info.name!r} has an empty DBG range")
+        leaf = VhdlLeafLayout(
+            suffix, type_info, 0, r.count, r.count, r.left, _dbg_range_right(r)
         )
-    if t.kind in {"vhdl_logic", "vhdl_bit", "vhdl_boolean"}:
-        return t, 1, 1, False, None, None
-    if t.kind == "vhdl_enum":
-        width = max(1, (len(t.enum_literals)-1).bit_length())
-        return t, width, 1, False, None, None
-    if t.kind == "vhdl_integer":
-        return t, 32, 4, False, None, None
-    if t.kind == "vhdl_time":
-        return t, 64, 8, False, None, None
-    if t.kind == "vhdl_real":
-        return t, 64, 8, True, None, None
+        return r.count, 1, [leaf], cursor + 1
+
+    if kind == "vhdl_integer":
+        return 4, 4, [VhdlLeafLayout(suffix, type_info, 0, 4, 32)], cursor
+
+    if kind == "vhdl_time":
+        return 8, 8, [VhdlLeafLayout(suffix, type_info, 0, 8, 64)], cursor
+
+    if kind == "vhdl_real":
+        return 8, 8, [VhdlLeafLayout(suffix, type_info, 0, 8, 64)], cursor
+
+    if kind == "vhdl_record":
+        if not type_info.record_fields:
+            raise DecodeError(f"VHDL record {type_info.name!r} has no field descriptors")
+        offset = 0
+        max_alignment = 1
+        leaves: list[VhdlLeafLayout] = []
+        cur = cursor
+        for field in type_info.record_fields:
+            if field.type_index >= len(types):
+                raise DecodeError(
+                    f"VHDL record {type_info.name!r} field {field.name!r} has invalid type index {field.type_index}"
+                )
+            child = types[field.type_index]
+            child_size, child_align, child_leaves, next_cur = _vhdl_layout_type(
+                child, types, ranges, cur, suffix + "." + field.name, stack
+            )
+            actual_ranges = tuple(
+                (r.left, _dbg_range_right(r), r.step) for r in ranges[cur:next_cur]
+            )
+            if actual_ranges != field.ranges:
+                raise DecodeError(
+                    f"VHDL record {type_info.name!r} field {field.name!r} DBG ranges "
+                    f"{actual_ranges!r} disagree with RTTI {field.ranges!r}"
+                )
+            field_offset = _align_up(offset, child_align)
+            for leaf in child_leaves:
+                leaves.append(VhdlLeafLayout(
+                    leaf.suffix,
+                    leaf.type_info,
+                    field_offset + leaf.offset,
+                    leaf.payload_bytes,
+                    leaf.width,
+                    leaf.range_left,
+                    leaf.range_right,
+                ))
+            offset = field_offset + child_size
+            max_alignment = max(max_alignment, child_align)
+            cur = next_cur
+        # DBG 006 rounds VHDL record allocations to an 8-byte storage unit,
+        # including records whose individual fields only require byte alignment.
+        # Field placement still follows each child's natural alignment.
+        record_alignment = max(8, max_alignment)
+        record_size = _align_up(offset, record_alignment)
+        return record_size, record_alignment, leaves, cur
+
+    if kind == "vhdl_array":
+        rank = type_info.array_rank
+        elem_idx = type_info.element_type_index
+        if rank <= 0 or elem_idx is None or elem_idx >= len(types):
+            raise DecodeError(f"VHDL array {type_info.name!r} has invalid RTTI element metadata")
+        if cursor + rank > len(ranges):
+            raise DecodeError(
+                f"VHDL array {type_info.name!r} needs {rank} concrete range(s), "
+                f"but only {len(ranges) - cursor} remain"
+            )
+        outer = ranges[cursor:cursor + rank]
+        if any(r.count <= 0 for r in outer):
+            raise DecodeError(f"VHDL array {type_info.name!r} has an empty dimension")
+        index_tuples: list[tuple[int, ...]] = [()]
+        for r in outer:
+            index_tuples = [prefix + (idx,) for prefix in index_tuples for idx in r.indices()]
+
+        elem_type = types[elem_idx]
+        elem_size, elem_align, elem_leaves, next_cur = _vhdl_layout_type(
+            elem_type, types, ranges, cursor + rank, "", stack
+        )
+        if elem_size <= 0:
+            raise DecodeError(f"VHDL array {type_info.name!r} has a zero-sized element")
+
+        leaves: list[VhdlLeafLayout] = []
+        for pos, idx_tuple in enumerate(index_tuples):
+            idx_suffix = "".join(f"[{idx}]" for idx in idx_tuple)
+            elem_offset = pos * elem_size
+            for leaf in elem_leaves:
+                leaves.append(VhdlLeafLayout(
+                    suffix + idx_suffix + leaf.suffix,
+                    leaf.type_info,
+                    elem_offset + leaf.offset,
+                    leaf.payload_bytes,
+                    leaf.width,
+                    leaf.range_left,
+                    leaf.range_right,
+                ))
+        return len(index_tuples) * elem_size, elem_align, leaves, next_cur
+
     raise DecodeError(
-        f"VHDL record field {field.name!r} uses uncharacterized nested type {t.name!r}/{t.kind}"
+        f"VHDL aggregate contains unsupported type {type_info.name!r}/{type_info.kind}"
     )
+
+
+def _vhdl_aggregate_layout(obj: DbgObject, types: list[RttiType]) -> VhdlAggregateLayout:
+    if obj.type_info is None or obj.type_info.kind not in {"vhdl_record", "vhdl_array"}:
+        raise DecodeError(f"{obj.path} is not a VHDL aggregate waveform")
+    size, alignment, leaves, cursor = _vhdl_layout_type(
+        obj.type_info, types, obj.dimensions, 0, ""
+    )
+    if cursor != len(obj.dimensions):
+        raise DecodeError(
+            f"VHDL aggregate {obj.path} consumed {cursor} of {len(obj.dimensions)} DBG ranges"
+        )
+    if size != obj.width:
+        raise DecodeError(
+            f"VHDL aggregate {obj.path} derives {size} bytes of native storage, "
+            f"but DBG allocation width is {obj.width} bytes"
+        )
+
+    covered = bytearray(size)
+    for leaf in leaves:
+        end = leaf.offset + leaf.payload_bytes
+        if leaf.offset < 0 or end > size:
+            raise DecodeError(
+                f"VHDL aggregate {obj.path}{leaf.suffix} lies outside its {size}-byte allocation"
+            )
+        for i in range(leaf.offset, end):
+            if covered[i]:
+                raise DecodeError(f"VHDL aggregate {obj.path} has overlapping leaf storage at byte {i}")
+            covered[i] = 1
+    return VhdlAggregateLayout(size, alignment, tuple(leaves))
+
+
+def _vhdl_layout_signature(layout: VhdlAggregateLayout) -> tuple[Any, ...]:
+    return (
+        layout.size,
+        layout.alignment,
+        tuple(
+            (
+                leaf.suffix,
+                leaf.type_info.kind,
+                leaf.type_info.name,
+                leaf.type_info.enum_literals,
+                leaf.offset,
+                leaf.payload_bytes,
+                leaf.width,
+                leaf.range_left,
+                leaf.range_right,
+            )
+            for leaf in layout.leaves
+        ),
+    )
+
+
+def _validate_vhdl_aggregate_padding(
+    events: list[RawEvent], layout: VhdlAggregateLayout, path: str
+) -> None:
+    covered = bytearray(layout.size)
+    for leaf in layout.leaves:
+        covered[leaf.offset:leaf.offset + leaf.payload_bytes] = b"\x01" * leaf.payload_bytes
+    padding = [i for i, used in enumerate(covered) if not used]
+    if not padding:
+        return
+    for event in events:
+        if len(event.payload) != layout.size:
+            raise ConversionError(
+                f"VHDL aggregate {path} event has {len(event.payload)} bytes, expected {layout.size}"
+            )
+        nonzero = [i for i in padding if event.payload[i] != 0]
+        if nonzero:
+            first = nonzero[0]
+            raise ConversionError(
+                f"VHDL aggregate {path} has non-zero data in native padding at byte {first}; "
+                "this storage layout is not characterized"
+            )
 
 
 # ===========================================================================
@@ -2233,6 +2447,7 @@ class Waveform:
 def ensure_output_dir() -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     return OUTPUT_DIR
+
 
 
 def canonical_hdl_path(path: str) -> str:
@@ -2593,157 +2808,86 @@ def load_wdb(inputs: list[Path], explicit_wcfg: Path | None = None) -> Waveform:
         for s in active_streams:
             base_sk = f"wdb:{int(s.absolute_addr or 0):X}"
 
-            # VHDL custom arrays are native one-element-per-storage-item
-            # aggregates, not Verilog aval/bval vectors.  RTTI gives the outer
-            # rank/element type and DBG gives concrete ranges, so expose every
-            # aggregate leaf as an ordinary portable waveform signal.
-            if s.storage_kind == "vhdl_array":
-                arrays = [o for o in s.dbg_objects if o.type_info and o.type_info.kind == "vhdl_array"]
-                if len(arrays) != len(s.dbg_objects):
+            # VHDL records and arrays use native aggregate storage. DBG range
+            # descriptors provide concrete array/vector bounds; RTTI provides
+            # recursive type structure. Expose every primitive leaf as a normal
+            # waveform signal while preserving the exact XSim alignment/padding.
+            if s.storage_kind in {"vhdl_record", "vhdl_array"}:
+                aggregates = [
+                    o for o in s.dbg_objects
+                    if o.type_info and o.type_info.kind in {"vhdl_record", "vhdl_array"}
+                ]
+                if len(aggregates) != len(s.dbg_objects):
                     raise ConversionError(
-                        f"runtime address 0x{int(s.absolute_addr or 0):X} mixes VHDL-array and non-array aliases"
+                        f"runtime address 0x{int(s.absolute_addr or 0):X} mixes VHDL aggregate "
+                        "and non-aggregate aliases"
                     )
-                shapes = [o.vhdl_array_leaf_shape for o in arrays]
-                if any(sh != shapes[0] for sh in shapes[1:]):
+                try:
+                    layouts = [_vhdl_aggregate_layout(o, dbg.rtti_types) for o in aggregates]
+                except DecodeError as exc:
+                    raise ConversionError(str(exc)) from exc
+                signatures = [_vhdl_layout_signature(layout) for layout in layouts]
+                if any(sig != signatures[0] for sig in signatures[1:]):
                     raise ConversionError(
-                        f"runtime address 0x{int(s.absolute_addr or 0):X} has VHDL-array aliases with different shapes"
+                        f"runtime address 0x{int(s.absolute_addr or 0):X} has VHDL aggregate aliases "
+                        "with different recursive layouts"
                     )
-                shape = shapes[0]
-                if shape is None:
-                    raise ConversionError("internal error: VHDL array has no leaf shape")
-                index_tuples, leaf_type, leaf_width, leaf_payload, leaf_dims = shape
-                if leaf_payload * len(index_tuples) != s.payload_bytes:
+                layout = layouts[0]
+                if layout.size != s.payload_bytes:
                     raise ConversionError(
-                        f"VHDL array at 0x{int(s.absolute_addr or 0):X} derives "
-                        f"{len(index_tuples)}x{leaf_payload}B leaves but runtime storage is {s.payload_bytes}B"
+                        f"VHDL aggregate at 0x{int(s.absolute_addr or 0):X} derives {layout.size}B "
+                        f"of storage but runtime allocation is {s.payload_bytes}B"
                     )
+                _validate_vhdl_aggregate_padding(s.events, layout, aggregates[0].path)
 
-                for pos, idx_tuple in enumerate(index_tuples):
-                    elem_sk = f"{base_sk}:vhdl_elem:{pos}"
-                    off = pos * leaf_payload
-                    elem_changes = [
-                        Change(e.time, _vhdl_leaf_value(leaf_type, e.payload[off:off + leaf_payload], leaf_width))
+                for li, leaf in enumerate(layout.leaves):
+                    leaf_sk = f"{base_sk}:vhdl_leaf:{li}"
+                    leaf_changes = [
+                        Change(
+                            e.time,
+                            _vhdl_leaf_value(
+                                leaf.type_info,
+                                e.payload[leaf.offset:leaf.offset + leaf.payload_bytes],
+                                leaf.width,
+                            ),
+                        )
                         for e in s.events
                     ]
-                    elem_changes = collapse_changes(elem_changes)
-                    estream = StreamInfo(elem_sk, elem_changes, [])
-                    streams[elem_sk] = estream
-                    suffix = "".join(f"[{idx}]" for idx in idx_tuple)
+                    leaf_changes = collapse_changes(leaf_changes)
+                    leaf_stream = StreamInfo(leaf_sk, leaf_changes, [])
+                    streams[leaf_sk] = leaf_stream
+
                     for oi, obj in enumerate(s.dbg_objects):
-                        cp = canonical_path(obj.path + suffix)
                         parent_cp = canonical_path(obj.path)
+                        cp = canonical_path(obj.path + leaf.suffix)
                         generated_paths.add(parent_cp)
                         generated_paths.add(cp)
                         wcfg_sig = style_map.get(cp) or style_map.get(parent_cp)
-                        key = f"{elem_sk}:{oi}"
-                        display_name = display_name_from_path(cp)
-                        if leaf_type.kind in {"vhdl_vector", "vhdl_bit_vector"} and len(leaf_dims) == 1:
-                            range_left = leaf_dims[0].left
-                            range_right = leaf_dims[0].left + leaf_dims[0].step * (leaf_dims[0].count - 1)
-                        elif leaf_width > 1 and leaf_type.kind != "vhdl_real":
-                            range_left, range_right = leaf_width - 1, 0
-                        else:
-                            range_left = range_right = None
-                        sig = SignalInfo(
-                            key=key,
-                            name=display_name,
-                            hdl_path=cp,
-                            scopes=obj.scopes,
-                            ref_name=obj.name + suffix,
-                            width=leaf_width,
-                            var_type=_vhdl_leaf_var_type(leaf_type),
-                            stream_key=elem_sk,
-                            is_real=(leaf_type.kind == "vhdl_real"),
-                            signed=_vhdl_leaf_signed(leaf_type),
-                            style=wcfg_sig.style if wcfg_sig else None,
-                            color=wcfg_sig.color if wcfg_sig else None,
-                            wcfg_radix=wcfg_sig.radix if wcfg_sig else None,
-                            range_left=range_left,
-                            range_right=range_right,
-                        )
-                        signals[key] = sig
-                        signal_order.append(key)
-                        estream.signal_keys.append(key)
-                        if default_selected is not None and (cp in wcfg_selected or parent_cp in wcfg_selected):
-                            default_selected.add(display_name)
-                continue
-
-            # VHDL records are flattened by their RTTI field descriptors.  The
-            # characterized logic/vector record layout is sequential field storage
-            # followed by zero padding to the DBG allocation size.  Other nested
-            # field storage remains fail-closed until characterized.
-            if s.storage_kind == "vhdl_record":
-                records = [o for o in s.dbg_objects if o.type_info and o.type_info.kind == "vhdl_record"]
-                if len(records) != len(s.dbg_objects):
-                    raise ConversionError(
-                        f"runtime address 0x{int(s.absolute_addr or 0):X} mixes VHDL-record and non-record aliases"
-                    )
-                schemas = [o.type_info.record_fields for o in records if o.type_info]
-                if not schemas or any(sc != schemas[0] for sc in schemas[1:]):
-                    raise ConversionError(
-                        f"runtime address 0x{int(s.absolute_addr or 0):X} has inconsistent VHDL record field schemas"
-                    )
-                fields = schemas[0]
-                offset = 0
-                field_specs: list[tuple[RttiField, RttiType, int, int, bool, int | None, int | None, int]] = []
-                for field in fields:
-                    ft, fw, fpb, freal, fl, fr = _vhdl_record_field_spec(field, dbg.rtti_types)
-                    if ft.kind not in {"vhdl_logic", "vhdl_vector", "vhdl_bit", "vhdl_bit_vector", "vhdl_boolean", "vhdl_enum"}:
-                        raise ConversionError(
-                            f"VHDL record {records[0].path} field {field.name!r} uses {ft.kind}; "
-                            "native alignment for that field class is not yet characterized"
-                        )
-                    field_specs.append((field, ft, fw, fpb, freal, fl, fr, offset))
-                    offset += fpb
-                if offset > s.payload_bytes:
-                    raise ConversionError(
-                        f"VHDL record {records[0].path} fields require {offset}B but storage is {s.payload_bytes}B"
-                    )
-                if offset < s.payload_bytes:
-                    for e in s.events:
-                        if any(e.payload[offset:]):
-                            raise ConversionError(
-                                f"VHDL record {records[0].path} has non-zero bytes in an uncharacterized padding region"
-                            )
-
-                for fi, (field, ft, fw, fpb, freal, fl, fr, foff) in enumerate(field_specs):
-                    fsk = f"{base_sk}:field:{fi}"
-                    fchanges = [
-                        Change(e.time, _vhdl_leaf_value(ft, e.payload[foff:foff + fpb], fw))
-                        for e in s.events
-                    ]
-                    fchanges = collapse_changes(fchanges)
-                    fstream = StreamInfo(fsk, fchanges, [])
-                    streams[fsk] = fstream
-                    for oi, obj in enumerate(s.dbg_objects):
-                        parent_cp = canonical_path(obj.path)
-                        cp = canonical_path(obj.path + "." + field.name)
-                        generated_paths.add(parent_cp)
-                        generated_paths.add(cp)
-                        wcfg_sig = style_map.get(cp) or style_map.get(parent_cp)
-                        key = f"{fsk}:{oi}"
+                        key = f"{leaf_sk}:{oi}"
                         display_name = display_name_from_path(cp)
                         sig = SignalInfo(
                             key=key,
                             name=display_name,
                             hdl_path=cp,
                             scopes=obj.scopes,
-                            ref_name=obj.name + "." + field.name,
-                            width=fw,
-                            var_type=_vhdl_leaf_var_type(ft),
-                            stream_key=fsk,
-                            is_real=freal,
-                            signed=_vhdl_leaf_signed(ft),
+                            ref_name=obj.name + leaf.suffix,
+                            width=leaf.width,
+                            var_type=_vhdl_leaf_var_type(leaf.type_info),
+                            stream_key=leaf_sk,
+                            is_real=(leaf.type_info.kind == "vhdl_real"),
+                            signed=_vhdl_leaf_signed(leaf.type_info),
                             style=wcfg_sig.style if wcfg_sig else None,
                             color=wcfg_sig.color if wcfg_sig else None,
                             wcfg_radix=wcfg_sig.radix if wcfg_sig else None,
-                            range_left=fl,
-                            range_right=fr,
+                            range_left=leaf.range_left,
+                            range_right=leaf.range_right,
                         )
                         signals[key] = sig
                         signal_order.append(key)
-                        fstream.signal_keys.append(key)
-                        if default_selected is not None and (cp in wcfg_selected or parent_cp in wcfg_selected):
+                        leaf_stream.signal_keys.append(key)
+                        if default_selected is not None and (
+                            cp in wcfg_selected or parent_cp in wcfg_selected
+                        ):
                             default_selected.add(display_name)
                 continue
 
