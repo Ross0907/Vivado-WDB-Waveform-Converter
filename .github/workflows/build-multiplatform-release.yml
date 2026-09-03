@@ -1,95 +1,320 @@
-name: Build multi-platform release binaries
+name: Release
 
-run-name: Build ${{ inputs.release_tag }} for Windows, Linux and macOS
+run-name: ${{ inputs.mode == 'release' && 'Release' || 'Rebuild' }} v${{ inputs.version }}
 
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: Existing GitHub release/tag to build
+      mode:
+        description: Create a new release or rebuild an existing one
         required: true
-        default: v2.0.1
+        default: release
+        type: choice
+        options:
+          - release
+          - rebuild
+      version:
+        description: Version number without the leading v, for example 2.0.3
+        required: true
+        type: string
+      release_summary:
+        description: Optional short summary placed above the generated release notes
+        required: false
+        default: ""
         type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
-  verify:
-    name: Verify release
+  prepare:
+    name: Prepare release
     runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      tag: ${{ steps.vars.outputs.tag }}
+      release_sha: ${{ steps.finish.outputs.release_sha }}
     steps:
-      - name: Check release exists
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate release input
+        id: vars
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must use x.y.z format, for example 2.0.3."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify new release does not already exist
+        if: inputs.mode == 'release'
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
-        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch origin --tags
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+            exit 1
+          fi
+
+      - name: Update application version
+        if: inputs.mode == 'release'
+        shell: bash
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("waveform_converter.py")
+          text = path.read_text(encoding="utf-8")
+          version = os.environ["VERSION"]
+          pattern = re.compile(r'^APP_VERSION = "([^"]+)"$', re.MULTILINE)
+          matches = pattern.findall(text)
+          if len(matches) != 1:
+              raise SystemExit(f"Expected exactly one APP_VERSION assignment, found {len(matches)}")
+          text = pattern.sub(f'APP_VERSION = "{version}"', text, count=1)
+          path.write_text(text, encoding="utf-8", newline="\n")
+          PY
+          python -m py_compile waveform_converter.py vcd_converter.py
+          git diff --check -- waveform_converter.py
+
+      - name: Commit version and push main
+        if: inputs.mode == 'release'
+        shell: bash
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          actual="$(python waveform_converter.py --version)"
+          if [[ "$actual" != *"$VERSION"* ]]; then
+            echo "Source version check failed: $actual"
+            exit 1
+          fi
+
+          if ! git diff --quiet -- waveform_converter.py; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- waveform_converter.py
+
+            mapfile -t staged < <(git diff --cached --name-only)
+            if [[ "${#staged[@]}" -ne 1 || "${staged[0]}" != "waveform_converter.py" ]]; then
+              printf 'Unexpected staged files:\n%s\n' "${staged[@]}"
+              exit 1
+            fi
+
+            git diff --cached --check
+            git commit -m "Release v$VERSION"
+            git push origin HEAD:main
+          fi
+
+      - name: Create tag and GitHub release
+        if: inputs.mode == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          SUMMARY: ${{ inputs.release_summary }}
+        run: |
+          set -euo pipefail
+          git tag -a "$TAG" -m "Vivado WDB Waveform Converter $TAG"
+          git push origin "$TAG"
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Vivado WDB Waveform Converter $TAG" \
+            --generate-notes
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > generated-notes.md
+
+          : > release-notes.md
+          if [[ -n "$SUMMARY" ]]; then
+            printf '%s\n\n' "$SUMMARY" >> release-notes.md
+          fi
+          cat generated-notes.md >> release-notes.md
+          cat >> release-notes.md <<EOF
+
+          Standalone builds are provided below for Windows x64, Linux x64, Linux ARM64, macOS Intel and macOS Apple Silicon. Each build has a SHA-256 sidecar.
+
+          <img src="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/images/logo.svg" alt="Vivado WDB Waveform Converter" width="1000">
+          EOF
+
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes-file release-notes.md
+
+      - name: Verify existing release for rebuild
+        if: inputs.mode == 'rebuild'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch origin --tags
+          git rev-parse --verify "refs/tags/$TAG^{commit}" >/dev/null
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+
+          git show "$TAG:waveform_converter.py" > /tmp/waveform_converter.py
+          actual="$(python /tmp/waveform_converter.py --version)"
+          if [[ "$actual" != *"$VERSION"* ]]; then
+            echo "Tagged source version check failed: $actual"
+            exit 1
+          fi
+
+      - name: Verify release logo exists
+        shell: bash
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch origin --tags
+          git cat-file -e "$TAG:images/logo.svg"
+
+      - name: Publish release outputs
+        id: finish
+        shell: bash
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-list -n 1 "$TAG")"
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "Release commit: $release_sha"
 
   windows-x64:
     name: Windows x64
-    needs: verify
+    needs: prepare
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Verify source version
+      - name: Install build dependencies
         shell: pwsh
         run: |
-          $expected = "${{ inputs.release_tag }}".TrimStart("v")
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller openpyxl
+          python -c "import tkinter, openpyxl; print('Tk', tkinter.TkVersion)"
+
+      - name: Verify source
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python -m py_compile waveform_converter.py vcd_converter.py
           $actual = (python waveform_converter.py --version | Out-String).Trim()
-          if ($actual -notmatch [regex]::Escape($expected)) {
-            throw "Source version '$actual' does not match release '$expected'."
+          if ($actual -notmatch [regex]::Escape($env:VERSION)) {
+            throw "Version mismatch: source '$actual', release '$env:VERSION'."
           }
 
-      - name: Build standalone executable
-        shell: cmd
-        run: BUILD_WINDOWS_EXE.bat --no-pause
-
-      - name: Prepare release asset
+      - name: Build Windows x64 executable
         shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          $version = "${{ inputs.release_tag }}".TrimStart("v")
-          New-Item -ItemType Directory -Force release-assets | Out-Null
-          $src = "release\VivadoWDBWaveformConverter-v$version.exe"
-          $dst = "release-assets\VivadoWDBWaveformConverter-v$version-Windows-x64.exe"
-          if (!(Test-Path $src)) { throw "Windows executable not found: $src" }
-          Copy-Item $src $dst
-          $hash = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
-          "$hash  $(Split-Path $dst -Leaf)" | Set-Content -Encoding ascii "$dst.sha256"
+          $parts = $env:VERSION.Split(".")
+          $major = [int]$parts[0]
+          $minor = [int]$parts[1]
+          $patch = [int]$parts[2]
 
-      - name: Upload individual Windows files
+          @"
+          VSVersionInfo(
+            ffi=FixedFileInfo(filevers=($major,$minor,$patch,0), prodvers=($major,$minor,$patch,0), mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
+            kids=[StringFileInfo([StringTable('040904B0', [
+              StringStruct('CompanyName', 'Roshan Tripathy'),
+              StringStruct('FileDescription', 'Vivado WDB Waveform Converter'),
+              StringStruct('FileVersion', '$env:VERSION'),
+              StringStruct('InternalName', 'VivadoWDBWaveformConverter'),
+              StringStruct('OriginalFilename', 'VivadoWDBWaveformConverter.exe'),
+              StringStruct('ProductName', 'Vivado WDB Waveform Converter'),
+              StringStruct('ProductVersion', '$env:VERSION')
+            ])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
+          )
+          "@ | Set-Content -Encoding ascii _version_info.txt
+
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name VivadoWDBWaveformConverter `
+            --version-file _version_info.txt `
+            --collect-all openpyxl `
+            --hidden-import tkinter `
+            --hidden-import tkinter.ttk `
+            --hidden-import tkinter.filedialog `
+            --hidden-import tkinter.messagebox `
+            waveform_converter.py
+
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          $asset = "VivadoWDBWaveformConverter-v$env:VERSION-Windows-x64.exe"
+          Copy-Item "dist\VivadoWDBWaveformConverter.exe" "release-assets\$asset"
+          $hash = (Get-FileHash -Algorithm SHA256 "release-assets\$asset").Hash.ToLower()
+          "$hash  $asset" | Set-Content -Encoding ascii "release-assets\$asset.sha256"
+
+      - name: Upload Windows files
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           Get-ChildItem release-assets -File | ForEach-Object {
             gh release upload $env:TAG $_.FullName --repo $env:GITHUB_REPOSITORY --clobber
-            if ($LASTEXITCODE -ne 0) { throw "Upload failed: $($_.Name)" }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Upload failed: $($_.Name)"
+            }
           }
 
   linux-x64:
     name: Linux x64
-    needs: verify
+    needs: prepare
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install runtime and build dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tk-dev tcl-dev
@@ -99,19 +324,18 @@ jobs:
 
       - name: Verify source
         env:
-          TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m py_compile waveform_converter.py vcd_converter.py
-          expected="${TAG#v}"
           actual="$(python waveform_converter.py --version)"
-          echo "$actual"
-          case "$actual" in
-            *"$expected"*) ;;
-            *) echo "Version mismatch: expected $expected"; exit 1 ;;
-          esac
+          [[ "$actual" == *"$VERSION"* ]]
 
       - name: Build Linux x64 executable
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m PyInstaller \
             --noconfirm \
             --clean \
@@ -124,42 +348,36 @@ jobs:
             --hidden-import tkinter.messagebox \
             waveform_converter.py
 
-      - name: Prepare release asset
-        env:
-          TAG: ${{ inputs.release_tag }}
-        run: |
-          version="${TAG#v}"
           mkdir -p release-assets
-          asset="VivadoWDBWaveformConverter-v${version}-Linux-x64"
+          asset="VivadoWDBWaveformConverter-v${VERSION}-Linux-x64"
           cp dist/VivadoWDBWaveformConverter "release-assets/$asset"
           chmod +x "release-assets/$asset"
           (cd release-assets && sha256sum "$asset" > "$asset.sha256")
-          file "release-assets/$asset"
 
-      - name: Upload individual Linux x64 files
+      - name: Upload Linux x64 files
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          for f in release-assets/*; do
-            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          set -euo pipefail
+          for file in release-assets/*; do
+            gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
           done
 
   linux-arm64:
     name: Linux ARM64
-    needs: verify
+    needs: prepare
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install runtime and build dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y tk-dev tcl-dev
@@ -169,19 +387,18 @@ jobs:
 
       - name: Verify source
         env:
-          TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m py_compile waveform_converter.py vcd_converter.py
-          expected="${TAG#v}"
           actual="$(python waveform_converter.py --version)"
-          echo "$actual"
-          case "$actual" in
-            *"$expected"*) ;;
-            *) echo "Version mismatch: expected $expected"; exit 1 ;;
-          esac
+          [[ "$actual" == *"$VERSION"* ]]
 
       - name: Build Linux ARM64 executable
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m PyInstaller \
             --noconfirm \
             --clean \
@@ -194,40 +411,34 @@ jobs:
             --hidden-import tkinter.messagebox \
             waveform_converter.py
 
-      - name: Prepare release asset
-        env:
-          TAG: ${{ inputs.release_tag }}
-        run: |
-          version="${TAG#v}"
           mkdir -p release-assets
-          asset="VivadoWDBWaveformConverter-v${version}-Linux-arm64"
+          asset="VivadoWDBWaveformConverter-v${VERSION}-Linux-arm64"
           cp dist/VivadoWDBWaveformConverter "release-assets/$asset"
           chmod +x "release-assets/$asset"
           (cd release-assets && sha256sum "$asset" > "$asset.sha256")
-          file "release-assets/$asset"
 
-      - name: Upload individual Linux ARM64 files
+      - name: Upload Linux ARM64 files
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          for f in release-assets/*; do
-            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          set -euo pipefail
+          for file in release-assets/*; do
+            gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
           done
 
   macos-intel:
     name: macOS Intel
-    needs: verify
+    needs: prepare
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install build dependencies
         run: |
@@ -237,41 +448,35 @@ jobs:
 
       - name: Verify source
         env:
-          TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m py_compile waveform_converter.py vcd_converter.py
-          expected="${TAG#v}"
           actual="$(python waveform_converter.py --version)"
-          echo "$actual"
-          case "$actual" in
-            *"$expected"*) ;;
-            *) echo "Version mismatch: expected $expected"; exit 1 ;;
-          esac
+          [[ "$actual" == *"$VERSION"* ]]
 
-      - name: Build macOS Intel application
+      - name: Build macOS Intel DMG
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m PyInstaller \
             --noconfirm \
             --clean \
             --onedir \
             --windowed \
             --name VivadoWDBWaveformConverter \
-            --osx-bundle-identifier com.ross0907.vivadownbwaveformconverter \
+            --osx-bundle-identifier com.ross0907.vivadowdbwaveformconverter \
             --collect-all openpyxl \
             --hidden-import tkinter \
             --hidden-import tkinter.ttk \
             --hidden-import tkinter.filedialog \
             --hidden-import tkinter.messagebox \
             waveform_converter.py
-          codesign --force --deep --sign - dist/VivadoWDBWaveformConverter.app
 
-      - name: Create individual DMG
-        env:
-          TAG: ${{ inputs.release_tag }}
-        run: |
-          version="${TAG#v}"
+          codesign --force --deep --sign - dist/VivadoWDBWaveformConverter.app
           mkdir -p release-assets
-          asset="VivadoWDBWaveformConverter-v${version}-macOS-Intel.dmg"
+          asset="VivadoWDBWaveformConverter-v${VERSION}-macOS-Intel.dmg"
           hdiutil create \
             -volname "Vivado WDB Waveform Converter" \
             -srcfolder dist/VivadoWDBWaveformConverter.app \
@@ -279,30 +484,29 @@ jobs:
             -format UDZO \
             "release-assets/$asset"
           (cd release-assets && shasum -a 256 "$asset" > "$asset.sha256")
-          file "release-assets/$asset"
 
-      - name: Upload individual macOS Intel files
+      - name: Upload macOS Intel files
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          for f in release-assets/*; do
-            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          set -euo pipefail
+          for file in release-assets/*; do
+            gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
           done
 
   macos-arm64:
     name: macOS Apple Silicon
-    needs: verify
+    needs: prepare
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install build dependencies
         run: |
@@ -312,41 +516,35 @@ jobs:
 
       - name: Verify source
         env:
-          TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m py_compile waveform_converter.py vcd_converter.py
-          expected="${TAG#v}"
           actual="$(python waveform_converter.py --version)"
-          echo "$actual"
-          case "$actual" in
-            *"$expected"*) ;;
-            *) echo "Version mismatch: expected $expected"; exit 1 ;;
-          esac
+          [[ "$actual" == *"$VERSION"* ]]
 
-      - name: Build macOS Apple Silicon application
+      - name: Build macOS Apple Silicon DMG
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          set -euo pipefail
           python -m PyInstaller \
             --noconfirm \
             --clean \
             --onedir \
             --windowed \
             --name VivadoWDBWaveformConverter \
-            --osx-bundle-identifier com.ross0907.vivadownbwaveformconverter \
+            --osx-bundle-identifier com.ross0907.vivadowdbwaveformconverter \
             --collect-all openpyxl \
             --hidden-import tkinter \
             --hidden-import tkinter.ttk \
             --hidden-import tkinter.filedialog \
             --hidden-import tkinter.messagebox \
             waveform_converter.py
-          codesign --force --deep --sign - dist/VivadoWDBWaveformConverter.app
 
-      - name: Create individual DMG
-        env:
-          TAG: ${{ inputs.release_tag }}
-        run: |
-          version="${TAG#v}"
+          codesign --force --deep --sign - dist/VivadoWDBWaveformConverter.app
           mkdir -p release-assets
-          asset="VivadoWDBWaveformConverter-v${version}-macOS-AppleSilicon.dmg"
+          asset="VivadoWDBWaveformConverter-v${VERSION}-macOS-AppleSilicon.dmg"
           hdiutil create \
             -volname "Vivado WDB Waveform Converter" \
             -srcfolder dist/VivadoWDBWaveformConverter.app \
@@ -354,13 +552,65 @@ jobs:
             -format UDZO \
             "release-assets/$asset"
           (cd release-assets && shasum -a 256 "$asset" > "$asset.sha256")
-          file "release-assets/$asset"
 
-      - name: Upload individual macOS Apple Silicon files
+      - name: Upload macOS Apple Silicon files
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          for f in release-assets/*; do
-            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          set -euo pipefail
+          for file in release-assets/*; do
+            gh release upload "$TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
           done
+
+  verify-assets:
+    name: Verify release assets
+    needs:
+      - prepare
+      - windows-x64
+      - linux-x64
+      - linux-arm64
+      - macos-intel
+      - macos-arm64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Verify all expected files are attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets > assets.json
+
+          python - <<'PY'
+          import json
+          import os
+
+          version = os.environ["VERSION"]
+          expected = {
+              f"VivadoWDBWaveformConverter-v{version}-Windows-x64.exe",
+              f"VivadoWDBWaveformConverter-v{version}-Windows-x64.exe.sha256",
+              f"VivadoWDBWaveformConverter-v{version}-Linux-x64",
+              f"VivadoWDBWaveformConverter-v{version}-Linux-x64.sha256",
+              f"VivadoWDBWaveformConverter-v{version}-Linux-arm64",
+              f"VivadoWDBWaveformConverter-v{version}-Linux-arm64.sha256",
+              f"VivadoWDBWaveformConverter-v{version}-macOS-Intel.dmg",
+              f"VivadoWDBWaveformConverter-v{version}-macOS-Intel.dmg.sha256",
+              f"VivadoWDBWaveformConverter-v{version}-macOS-AppleSilicon.dmg",
+              f"VivadoWDBWaveformConverter-v{version}-macOS-AppleSilicon.dmg.sha256",
+          }
+
+          payload = json.load(open("assets.json", encoding="utf-8"))
+          actual = {asset["name"] for asset in payload["assets"]}
+          missing = sorted(expected - actual)
+
+          print(f"Found {len(actual)} attached release assets.")
+          for name in sorted(expected):
+              print(("FOUND   " if name in actual else "MISSING ") + name)
+
+          if missing:
+              raise SystemExit("Release is incomplete: missing " + ", ".join(missing))
+
+          print("All expected platform builds and SHA-256 files are attached.")
+          PY
