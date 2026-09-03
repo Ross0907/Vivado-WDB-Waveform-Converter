@@ -1,0 +1,366 @@
+name: Build multi-platform release binaries
+
+run-name: Build ${{ inputs.release_tag }} for Windows, Linux and macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub release/tag to build
+        required: true
+        default: v2.0.1
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
+
+  windows-x64:
+    name: Windows x64
+    needs: verify
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify source version
+        shell: pwsh
+        run: |
+          $expected = "${{ inputs.release_tag }}".TrimStart("v")
+          $actual = (python waveform_converter.py --version | Out-String).Trim()
+          if ($actual -notmatch [regex]::Escape($expected)) {
+            throw "Source version '$actual' does not match release '$expected'."
+          }
+
+      - name: Build standalone executable
+        shell: cmd
+        run: BUILD_WINDOWS_EXE.bat --no-pause
+
+      - name: Prepare release asset
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.release_tag }}".TrimStart("v")
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          $src = "release\VivadoWDBWaveformConverter-v$version.exe"
+          $dst = "release-assets\VivadoWDBWaveformConverter-v$version-Windows-x64.exe"
+          if (!(Test-Path $src)) { throw "Windows executable not found: $src" }
+          Copy-Item $src $dst
+          $hash = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
+          "$hash  $(Split-Path $dst -Leaf)" | Set-Content -Encoding ascii "$dst.sha256"
+
+      - name: Upload individual Windows files
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          Get-ChildItem release-assets -File | ForEach-Object {
+            gh release upload $env:TAG $_.FullName --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Upload failed: $($_.Name)" }
+          }
+
+  linux-x64:
+    name: Linux x64
+    needs: verify
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tk-dev tcl-dev
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller openpyxl
+          python -c "import tkinter, openpyxl; print('Tk', tkinter.TkVersion)"
+
+      - name: Verify source
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          python -m py_compile waveform_converter.py vcd_converter.py
+          expected="${TAG#v}"
+          actual="$(python waveform_converter.py --version)"
+          echo "$actual"
+          case "$actual" in
+            *"$expected"*) ;;
+            *) echo "Version mismatch: expected $expected"; exit 1 ;;
+          esac
+
+      - name: Build Linux x64 executable
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onefile \
+            --name VivadoWDBWaveformConverter \
+            --collect-all openpyxl \
+            --hidden-import tkinter \
+            --hidden-import tkinter.ttk \
+            --hidden-import tkinter.filedialog \
+            --hidden-import tkinter.messagebox \
+            waveform_converter.py
+
+      - name: Prepare release asset
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p release-assets
+          asset="VivadoWDBWaveformConverter-v${version}-Linux-x64"
+          cp dist/VivadoWDBWaveformConverter "release-assets/$asset"
+          chmod +x "release-assets/$asset"
+          (cd release-assets && sha256sum "$asset" > "$asset.sha256")
+          file "release-assets/$asset"
+
+      - name: Upload individual Linux x64 files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          for f in release-assets/*; do
+            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
+  linux-arm64:
+    name: Linux ARM64
+    needs: verify
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tk-dev tcl-dev
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller openpyxl
+          python -c "import tkinter, openpyxl; print('Tk', tkinter.TkVersion)"
+
+      - name: Verify source
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          python -m py_compile waveform_converter.py vcd_converter.py
+          expected="${TAG#v}"
+          actual="$(python waveform_converter.py --version)"
+          echo "$actual"
+          case "$actual" in
+            *"$expected"*) ;;
+            *) echo "Version mismatch: expected $expected"; exit 1 ;;
+          esac
+
+      - name: Build Linux ARM64 executable
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onefile \
+            --name VivadoWDBWaveformConverter \
+            --collect-all openpyxl \
+            --hidden-import tkinter \
+            --hidden-import tkinter.ttk \
+            --hidden-import tkinter.filedialog \
+            --hidden-import tkinter.messagebox \
+            waveform_converter.py
+
+      - name: Prepare release asset
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p release-assets
+          asset="VivadoWDBWaveformConverter-v${version}-Linux-arm64"
+          cp dist/VivadoWDBWaveformConverter "release-assets/$asset"
+          chmod +x "release-assets/$asset"
+          (cd release-assets && sha256sum "$asset" > "$asset.sha256")
+          file "release-assets/$asset"
+
+      - name: Upload individual Linux ARM64 files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          for f in release-assets/*; do
+            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
+  macos-intel:
+    name: macOS Intel
+    needs: verify
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller openpyxl
+          python -c "import tkinter, openpyxl; print('Tk', tkinter.TkVersion)"
+
+      - name: Verify source
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          python -m py_compile waveform_converter.py vcd_converter.py
+          expected="${TAG#v}"
+          actual="$(python waveform_converter.py --version)"
+          echo "$actual"
+          case "$actual" in
+            *"$expected"*) ;;
+            *) echo "Version mismatch: expected $expected"; exit 1 ;;
+          esac
+
+      - name: Build macOS Intel application
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --windowed \
+            --name VivadoWDBWaveformConverter \
+            --osx-bundle-identifier com.ross0907.vivadownbwaveformconverter \
+            --collect-all openpyxl \
+            --hidden-import tkinter \
+            --hidden-import tkinter.ttk \
+            --hidden-import tkinter.filedialog \
+            --hidden-import tkinter.messagebox \
+            waveform_converter.py
+          codesign --force --deep --sign - dist/VivadoWDBWaveformConverter.app
+
+      - name: Create individual DMG
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p release-assets
+          asset="VivadoWDBWaveformConverter-v${version}-macOS-Intel.dmg"
+          hdiutil create \
+            -volname "Vivado WDB Waveform Converter" \
+            -srcfolder dist/VivadoWDBWaveformConverter.app \
+            -ov \
+            -format UDZO \
+            "release-assets/$asset"
+          (cd release-assets && shasum -a 256 "$asset" > "$asset.sha256")
+          file "release-assets/$asset"
+
+      - name: Upload individual macOS Intel files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          for f in release-assets/*; do
+            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
+  macos-arm64:
+    name: macOS Apple Silicon
+    needs: verify
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller openpyxl
+          python -c "import tkinter, openpyxl; print('Tk', tkinter.TkVersion)"
+
+      - name: Verify source
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          python -m py_compile waveform_converter.py vcd_converter.py
+          expected="${TAG#v}"
+          actual="$(python waveform_converter.py --version)"
+          echo "$actual"
+          case "$actual" in
+            *"$expected"*) ;;
+            *) echo "Version mismatch: expected $expected"; exit 1 ;;
+          esac
+
+      - name: Build macOS Apple Silicon application
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onedir \
+            --windowed \
+            --name VivadoWDBWaveformConverter \
+            --osx-bundle-identifier com.ross0907.vivadownbwaveformconverter \
+            --collect-all openpyxl \
+            --hidden-import tkinter \
+            --hidden-import tkinter.ttk \
+            --hidden-import tkinter.filedialog \
+            --hidden-import tkinter.messagebox \
+            waveform_converter.py
+          codesign --force --deep --sign - dist/VivadoWDBWaveformConverter.app
+
+      - name: Create individual DMG
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p release-assets
+          asset="VivadoWDBWaveformConverter-v${version}-macOS-AppleSilicon.dmg"
+          hdiutil create \
+            -volname "Vivado WDB Waveform Converter" \
+            -srcfolder dist/VivadoWDBWaveformConverter.app \
+            -ov \
+            -format UDZO \
+            "release-assets/$asset"
+          (cd release-assets && shasum -a 256 "$asset" > "$asset.sha256")
+          file "release-assets/$asset"
+
+      - name: Upload individual macOS Apple Silicon files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          for f in release-assets/*; do
+            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
