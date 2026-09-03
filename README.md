@@ -31,7 +31,6 @@ WDB/WCFG input defaults to **VCD**. VCD input defaults to **CSV**.
 - Right-click per-signal radix selection
 - WCFG-derived radix defaults
 - Wide vectors and X/Z state preservation
-- SystemVerilog `real`
 - Packed and unpacked arrays
 - Multidimensional arrays
 - VHDL scalar, vector, array, record, integer, time and real types
