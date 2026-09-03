@@ -1,0 +1,44 @@
+# Converter output
+vcd_output/
+converted_output/
+*.vcd
+*.wdb
+*.wdbdecode.log
+*.csv
+*.json
+*.xlsx
+batch_conversion_report.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Vivado generated files
+*.xpr
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+*.jou
+*.log
+
+# Build output
+build/
+dist/
+*.spec
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Standalone executable builder
+.exe-build-venv/
+release/
+VivadoWDBWaveformConverter-v*-Windows-x64.zip
+_version_info.txt
+_version_check.txt
