@@ -39,7 +39,7 @@ try:
 except ImportError:
     HAS_TK = False
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 
 WDB_MAGIC = b"Xilinx WAVE DATABASE 01\x00"
 DBG_MAGIC = b"Xilinx ISim DBG 006\x00"
