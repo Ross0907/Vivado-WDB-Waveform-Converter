@@ -28,7 +28,7 @@ import threading
 import xml.etree.ElementTree as ET
 import zlib
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -125,6 +125,11 @@ class RttiType:
     array_rank: int = 0
     enum_literals: tuple[str, ...] = ()
     record_fields: tuple[RttiField, ...] = ()
+    layout: int | None = None
+    alias_target: int | None = None
+    type_ranges: tuple[tuple[int, int, int], ...] = ()
+    enum_storage_bytes: int = 1
+    physical_units: tuple[tuple[str, int], ...] = ()
 
     @property
     def is_real(self) -> bool:
@@ -153,9 +158,9 @@ class RttiType:
     @property
     def is_supported_waveform(self) -> bool:
         return self.kind in {
-            "sv_digital", "sv_unpacked_array", "sv_real",
+            "sv_digital", "sv_unpacked_array", "sv_unpacked_struct", "sv_real",
             "vhdl_logic", "vhdl_bit", "vhdl_vector", "vhdl_bit_vector",
-            "vhdl_integer", "vhdl_time", "vhdl_real", "vhdl_boolean",
+            "vhdl_integer", "vhdl_time", "vhdl_physical", "vhdl_real", "vhdl_boolean",
             "vhdl_enum", "vhdl_record", "vhdl_array",
         }
 
@@ -201,6 +206,7 @@ class DbgObject:
     alloc_flags: int
     object_index_field: int
     port_index: int
+    slice_offset: int = 0
     type_info: RttiType | None = None
     dimensions: tuple[DbgRange, ...] = ()
     scopes: tuple[str, ...] = ()
@@ -234,7 +240,7 @@ class DbgObject:
         kind = self.storage_kind
         if kind in {"vhdl_integer"}:
             return 32
-        if kind == "vhdl_time":
+        if kind in {"vhdl_time", "vhdl_physical"}:
             return 64
         if kind in {"sv_real", "vhdl_real"}:
             return 64
@@ -256,10 +262,10 @@ class DbgObject:
             return max(1, self.width)
         if kind == "vhdl_integer":
             return 4
-        if kind == "vhdl_time":
+        if kind in {"vhdl_time", "vhdl_physical"}:
             return 8
         if kind == "vhdl_enum":
-            return 1
+            return int(self.type_info.enum_storage_bytes if self.type_info else 1)
         if kind == "vhdl_record":
             # Characterized DBG 006 records expose their padded runtime storage
             # byte count in the object width field (record_v: 5 data bytes -> 8).
@@ -278,7 +284,7 @@ class DbgObject:
                 return 8 * len(leaves)
             words = max(1, (self.bit_width + 31) // 32)
             return 8 * words
-        if kind == "sv_digital":
+        if kind in {"sv_digital", "sv_unpacked_struct"}:
             words = max(1, (self.bit_width + 31) // 32)
             return 8 * words
         raise DecodeError(
@@ -295,7 +301,11 @@ class DbgObject:
     @property
     def is_signed(self) -> bool:
         tname = self.type_info.name.lower() if self.type_info else ""
-        return bool(self.signed_code != 0 or tname in {"signed", "integer"})
+        return bool(
+            self.signed_code != 0
+            or tname in {"signed", "integer"}
+            or self.storage_kind == "vhdl_physical"
+        )
 
     @property
     def vcd_var_type(self) -> str:
@@ -412,14 +422,14 @@ class DbgObject:
             if leaf_dims:
                 raise DecodeError(f"VHDL scalar-array leaf {self.path} unexpectedly has dimensions")
             leaf_width = max(1, (len(leaf.enum_literals)-1).bit_length()) if leaf.kind == "vhdl_enum" else 1
-            leaf_payload = 1
+            leaf_payload = leaf.enum_storage_bytes if leaf.kind == "vhdl_enum" else 1
         elif leaf.kind == "vhdl_integer":
             if leaf_dims:
                 raise DecodeError(f"VHDL integer-array leaf {self.path} unexpectedly has dimensions")
             leaf_width, leaf_payload = 32, 4
-        elif leaf.kind == "vhdl_time":
+        elif leaf.kind in {"vhdl_time", "vhdl_physical"}:
             if leaf_dims:
-                raise DecodeError(f"VHDL time-array leaf {self.path} unexpectedly has dimensions")
+                raise DecodeError(f"VHDL physical-array leaf {self.path} unexpectedly has dimensions")
             leaf_width, leaf_payload = 64, 8
         elif leaf.kind == "vhdl_real":
             if leaf_dims:
@@ -511,6 +521,7 @@ class Stream:
     absolute_addr: int | None = None
     dbg_objects: list[DbgObject] = field(default_factory=list)
     selected_objects: list[DbgObject] = field(default_factory=list)
+    storage_object: DbgObject | None = None
 
     def observed_digital_width(self) -> int:
         if self.payload_bytes % 8 != 0:
@@ -529,6 +540,8 @@ class Stream:
 
     @property
     def storage_kind(self) -> str:
+        if self.storage_object is not None:
+            return self.storage_object.storage_kind
         kinds = {o.storage_kind for o in self.dbg_objects}
         if len(kinds) != 1:
             raise DecodeError(
@@ -539,6 +552,8 @@ class Stream:
 
     @property
     def is_real(self) -> bool:
+        if self.storage_object is not None:
+            return self.storage_object.is_real
         kinds = {o.is_real for o in self.dbg_objects}
         if len(kinds) != 1:
             raise DecodeError(
@@ -548,6 +563,8 @@ class Stream:
 
     @property
     def width(self) -> int:
+        if self.storage_object is not None:
+            return self.storage_object.bit_width
         if not self.dbg_objects:
             raise DecodeError("stream has no DBG object mapping")
         widths = {o.bit_width for o in self.dbg_objects}
@@ -608,8 +625,24 @@ def _structure_scope_chain(structures: list[DbgStructure], owner: int) -> tuple[
     return tuple(names)
 
 
+
+def _rtti_triplet_count(r: tuple[int, int, int]) -> int | None:
+    left, right, step = r
+    if step == -2:
+        return None
+    if step == 1 and right >= left:
+        return right - left + 1
+    if step == -1 and left >= right:
+        return left - right + 1
+    raise DecodeError(f"invalid RTTI range ({left},{right},{step})")
+
+
 def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
-    """Parse the embedded XSim TYPE FILE 001 table used by DBG object type indices."""
+    """Parse the embedded XSim TYPE FILE 001 table used by DBG object type indices.
+
+    The recognized subset is deliberately limited to waveform-bearing types
+    characterized on XSim 2026.1. Unsupported RTTI shapes remain fail-closed.
+    """
     pos = b.find(RTTI_TYPE_MAGIC)
     if pos < 0:
         raise DecodeError("embedded 'Xilinx ISim TYPE FILE 001' RTTI table was not found")
@@ -619,8 +652,23 @@ def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
     _checksum, count, body_size = struct.unpack_from("<3I", b, hdr)
     if count <= 0 or count > 1_000_000:
         raise DecodeError(f"implausible RTTI type count: {count}")
+
     off = hdr + 12
     types: list[RttiType] = []
+
+    def parse_triples(blob: bytes, cur: int, n: int) -> tuple[tuple[tuple[int, int, int], ...], int]:
+        if n < 0 or n > 1024 or cur + 12 * n > len(blob):
+            raise DecodeError("invalid RTTI range list")
+        out: list[tuple[int, int, int]] = []
+        for _ in range(n):
+            lraw, rraw, sraw = struct.unpack_from("<3I", blob, cur)
+            cur += 12
+            step = _s32(sraw)
+            if step not in {-2, -1, 1}:
+                raise DecodeError(f"unsupported RTTI range direction {step}")
+            out.append((_s32(lraw), _s32(rraw), step))
+        return tuple(out), cur
+
     for idx in range(count):
         if off + 8 > len(b):
             raise DecodeError(f"truncated RTTI type record {idx}")
@@ -633,48 +681,30 @@ def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
             raise DecodeError(f"RTTI type record {idx} has no terminated name")
         name = raw[8:z].decode("utf-8", errors="replace")
         lname = name.lower()
-        # XSim RTTI records carry a front-end/language code immediately after
-        # named scalar types: 2 for VHDL and 5 for Verilog/SystemVerilog in all
-        # characterized DBG 006 datasets. Anonymous SV composite types do not
-        # carry this field in the same position, so exact type/tag recognition is
-        # used for VHDL and the existing SV representation remains the default.
-        lang_code = None
-        if z + 5 <= len(raw):
-            try:
-                lang_code = struct.unpack_from("<I", raw, z + 1)[0]
-            except struct.error:
-                pass
-        language = "vhdl" if lang_code == 2 else "sv" if lang_code == 5 else "unknown"
+        uname = name.upper()
+        tail = raw[z + 1:]
+
+        origin = struct.unpack_from("<I", tail, 0)[0] if len(tail) >= 4 else None
+        language = (
+            "vhdl" if origin in {2, 0xA}
+            else "sv" if origin in {1, 5}
+            else "unknown"
+        )
         kind = "sv_digital"
+        layout: int | None = None
+        alias_target: int | None = None
+        type_ranges: tuple[tuple[int, int, int], ...] = ()
         array_flavor: str | None = None
         element_type_index: int | None = None
         array_rank = 0
         enum_literals: tuple[str, ...] = ()
+        enum_storage_bytes = 1
+        physical_units: tuple[tuple[str, int], ...] = ()
         record_fields: tuple[RttiField, ...] = ()
-        # Anonymous SystemVerilog array RTTI records are recursive.  The first
-        # three u32 fields after the empty-name terminator are: version=1,
-        # array descriptor (0x00A00002 unpacked / 0x00A00003 packed), and the
-        # element RTTI index.  This is what distinguishes e.g. real[0:2] from a
-        # 96-bit digital aggregate and reveals multidimensional unpacked rank.
-        if tag == 0xA0000010 and name == "":
-            tail = raw[z + 1:]
-            if len(tail) >= 12:
-                ver, descriptor, elem_idx = struct.unpack_from("<3I", tail, 0)
-                if ver == 1 and descriptor in {0x00A00002, 0x00A00003}:
-                    array_flavor = "unpacked" if descriptor == 0x00A00002 else "packed"
-                    if elem_idx < count:
-                        element_type_index = elem_idx
 
-        # Named VHDL composite/enum RTTI is self-describing as well.  These
-        # structures were characterized from XSim 2026.1 DBG 006 rather than
-        # inferred from waveform values:
-        #   enum   A0000003: lang, class, scalar-code, literal-count, strings...
-        #   array  A0000010: lang, A00001, element-type-index, rank, ...
-        #   record A0000011: lang, 000B0001, field-count, then per-field
-        #                    name, type-index, range-count, (left,right,step)*N.
-        tail = raw[z + 1:]
-        if language == "vhdl" and tag == 0xA0000003 and len(tail) >= 16:
-            _lang, _enum_class, _scalar_code, literal_count = struct.unpack_from("<4I", tail, 0)
+        # Enumeration: origin, variant, class, count, literal strings, storage trailer.
+        if tag == 0xA0000003 and len(tail) >= 16:
+            _origin, _variant, _enum_class, literal_count = struct.unpack_from("<4I", tail, 0)
             if 0 < literal_count <= 65536:
                 cur = 16
                 lits: list[str] = []
@@ -686,19 +716,44 @@ def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
                         break
                     lits.append(tail[cur:zz].decode("utf-8", errors="replace"))
                     cur = zz + 1
-                if ok:
+                if ok and cur + 4 <= len(tail):
+                    trailer = struct.unpack_from("<I", tail, cur)[0]
                     enum_literals = tuple(lits)
+                    if language == "vhdl":
+                        if trailer not in {1, 4}:
+                            raise DecodeError(
+                                f"VHDL enumeration {name!r} has unsupported storage trailer {trailer}"
+                            )
+                        enum_storage_bytes = int(trailer)
 
-        if language == "vhdl" and tag == 0xA0000010 and len(tail) >= 16:
-            _lang, descriptor, elem_idx, rank = struct.unpack_from("<4I", tail, 0)
-            if descriptor == 0x00A00001 and elem_idx < count and 0 < rank <= 32:
-                array_flavor = "vhdl_array"
-                element_type_index = elem_idx
-                array_rank = rank
+        # Array: origin, packed descriptor (layout in low 16 bits), element,
+        # number of dimensions, index type IDs, concrete/placeholder triples.
+        if tag == 0xA0000010 and len(tail) >= 16:
+            _origin, descriptor, elem_idx, dims = struct.unpack_from("<4I", tail, 0)
+            if (descriptor >> 16) == 0xA0 and 0 < dims <= 32 and elem_idx < count:
+                layout = descriptor & 0xFFFF
+                cur = 16 + 4 * dims
+                if cur + 4 <= len(tail):
+                    nranges = struct.unpack_from("<I", tail, cur)[0]
+                    cur += 4
+                    try:
+                        type_ranges, cur = parse_triples(tail, cur, int(nranges))
+                    except DecodeError:
+                        type_ranges = ()
+                element_type_index = int(elem_idx)
+                array_rank = int(dims)
+                if layout == 1 and language == "vhdl":
+                    array_flavor = "vhdl_array"
+                elif layout == 2 and language == "sv":
+                    array_flavor = "unpacked"
+                elif layout == 3 and language == "sv":
+                    array_flavor = "packed"
 
-        if language == "vhdl" and tag == 0xA0000011 and len(tail) >= 12:
-            _lang, descriptor, field_count = struct.unpack_from("<3I", tail, 0)
-            if descriptor == 0x000B0001 and 0 < field_count <= 4096:
+        # Record: origin, descriptor (0x000B0001/2/3), field count, fields.
+        if tag == 0xA0000011 and len(tail) >= 12:
+            _origin, descriptor, field_count = struct.unpack_from("<3I", tail, 0)
+            if (descriptor >> 16) == 0x000B and 0 < field_count <= 4096:
+                layout = descriptor & 0xFFFF
                 cur = 12
                 fields: list[RttiField] = []
                 ok = True
@@ -714,33 +769,54 @@ def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
                         break
                     ftype, rcount = struct.unpack_from("<2I", tail, cur)
                     cur += 8
-                    if ftype >= count or rcount > 32 or cur + 12 * rcount > len(tail):
+                    if ftype >= count or rcount > 64:
                         ok = False
                         break
-                    franges: list[tuple[int, int, int]] = []
-                    for _r in range(rcount):
-                        left_raw, right_raw, step_raw = struct.unpack_from("<3I", tail, cur)
-                        cur += 12
-                        step = -1 if step_raw == 0xFFFFFFFF else int(step_raw)
-                        if step not in {-1, 1}:
-                            ok = False
-                            break
-                        franges.append((_s32(left_raw), _s32(right_raw), step))
-                    if not ok:
+                    try:
+                        franges, cur = parse_triples(tail, cur, int(rcount))
+                    except DecodeError:
+                        ok = False
                         break
-                    fields.append(RttiField(fname, int(ftype), tuple(franges)))
+                    fields.append(RttiField(fname, int(ftype), franges))
                 if ok and len(fields) == field_count:
                     record_fields = tuple(fields)
 
-        uname = name.upper()
-        # VHDL TIME uses a physical-type RTTI record whose field immediately
-        # after the name is the unit count rather than the usual language code.
-        # The uppercase name + physical-type tag is unambiguous in DBG 006.
-        if tag == 0xA000000D and uname == "TIME":
-            language = "vhdl"
-            kind = "vhdl_time"
+        # Alias: origin, target, range count, ranges.
+        if tag == 0xA0000007 and len(tail) >= 12:
+            _origin, target, nranges = struct.unpack_from("<3I", tail, 0)
+            if target < count and nranges <= 64:
+                alias_target = int(target)
+                try:
+                    type_ranges, _ = parse_triples(tail, 12, int(nranges))
+                except DecodeError:
+                    type_ranges = ()
+
+        # Physical: origin, unit count, repeated NUL-name + u64 scale.
+        if tag == 0xA000000D and len(tail) >= 8:
+            _origin, unit_count = struct.unpack_from("<2I", tail, 0)
+            if 0 < unit_count <= 128:
+                cur = 8
+                units: list[tuple[str, int]] = []
+                ok = True
+                for _ in range(unit_count):
+                    zz = tail.find(b"\0", cur)
+                    if zz < 0 or zz + 9 > len(tail):
+                        ok = False
+                        break
+                    unit_name = tail[cur:zz].decode("utf-8", errors="replace")
+                    cur = zz + 1
+                    scale = struct.unpack_from("<Q", tail, cur)[0]
+                    cur += 8
+                    units.append((unit_name, int(scale)))
+                if ok:
+                    physical_units = tuple(units)
+                    language = "vhdl"
+
+        # Classify the characterized waveform-bearing subset.
+        if tag == 0xA000000D and physical_units:
+            kind = "vhdl_time" if uname == "TIME" else "vhdl_physical"
         elif language == "vhdl":
-            if tag == 0xA0000006 and uname in {"REAL"}:
+            if tag == 0xA0000006 and uname == "REAL":
                 kind = "vhdl_real"
             elif tag == 0xA0000003 and uname in {"STD_LOGIC", "STD_ULOGIC"}:
                 kind = "vhdl_logic"
@@ -759,27 +835,73 @@ def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
                 kind = "vhdl_integer"
             elif tag == 0xA0000003 and enum_literals:
                 kind = "vhdl_enum"
-            elif tag == 0xA0000011 and record_fields:
+            elif tag == 0xA0000011 and layout == 1 and record_fields:
                 kind = "vhdl_record"
-            elif tag == 0xA0000010 and array_flavor == "vhdl_array" and element_type_index is not None:
+            elif tag == 0xA0000010 and layout == 1 and element_type_index is not None:
                 kind = "vhdl_array"
+            elif tag == 0xA0000007 and alias_target is not None:
+                kind = "unsupported"  # resolved after the complete table is parsed
             else:
-                # Files/access types and uncharacterized VHDL structures remain
-                # fail-closed until their WDB storage has been characterized.
                 kind = "unsupported"
         else:
             if tag == 0xA0000006 and lname in {"real", "realtime"}:
                 kind = "sv_real"
-            elif array_flavor == "unpacked":
+            elif tag == 0xA0000011 and layout == 2 and record_fields:
+                kind = "sv_unpacked_struct"
+            elif tag == 0xA0000011 and layout == 3 and record_fields:
+                # Packed structs use the ordinary packed aval/bval representation.
+                kind = "sv_digital"
+            elif tag == 0xA0000010 and layout == 2:
                 kind = "sv_unpacked_array"
+            elif tag == 0xA0000007 and alias_target is not None:
+                kind = "unsupported"  # resolved below
             else:
                 kind = "sv_digital"
 
-        types.append(RttiType(idx, size, tag, name, raw, kind, language, array_flavor,
-                              element_type_index, array_rank, enum_literals, record_fields))
+        types.append(RttiType(
+            index=idx, size=size, tag=tag, name=name, raw=raw,
+            kind=kind, language=language, array_flavor=array_flavor,
+            element_type_index=element_type_index, array_rank=array_rank,
+            enum_literals=enum_literals, record_fields=record_fields,
+            layout=layout, alias_target=alias_target, type_ranges=type_ranges,
+            enum_storage_bytes=enum_storage_bytes, physical_units=physical_units,
+        ))
         off += size
 
-    # body_size is an implementation detail, but it must not point outside the file.
+    # Resolve typedef/subtype aliases without discarding the alias's own name or
+    # concrete range list. Struct typedefs in SystemVerilog point at anonymous
+    # record entries, so following this chain is required for semantic layout.
+    resolved: dict[int, RttiType] = {}
+
+    def resolve(i: int, stack: tuple[int, ...] = ()) -> RttiType:
+        if i in resolved:
+            return resolved[i]
+        if i in stack:
+            raise DecodeError(f"cyclic RTTI alias chain at type {i}")
+        t = types[i]
+        if t.alias_target is None:
+            resolved[i] = t
+            return t
+        target = resolve(t.alias_target, stack + (i,))
+        merged = replace(
+            t,
+            kind=target.kind,
+            language=target.language,
+            array_flavor=target.array_flavor,
+            element_type_index=target.element_type_index,
+            array_rank=target.array_rank,
+            enum_literals=target.enum_literals,
+            record_fields=target.record_fields,
+            layout=target.layout,
+            enum_storage_bytes=target.enum_storage_bytes,
+            physical_units=target.physical_units,
+            type_ranges=(t.type_ranges if t.type_ranges else target.type_ranges),
+        )
+        resolved[i] = merged
+        return merged
+
+    types = [resolve(i) for i in range(len(types))]
+
     if body_size and pos + body_size > len(b) + 64:
         raise DecodeError("RTTI TYPE FILE body size points outside the WDB")
     log.add("=== Embedded RTTI TYPE FILE 001 ===")
@@ -787,9 +909,11 @@ def parse_rtti_types(b: bytes, log: Logger) -> list[RttiType]:
     log.add(f"type records          : {len(types)}")
     reals = [f"{t.index}:{t.name}/{t.kind}" for t in types if t.is_real]
     unpacked = [str(t.index) for t in types if t.is_unpacked_array]
+    sv_structs = [str(t.index) for t in types if t.kind == "sv_unpacked_struct"]
     vhdl = [f"{t.index}:{t.name}/{t.kind}" for t in types if t.is_vhdl and t.is_supported_waveform]
     log.add("real types            : " + (", ".join(reals) if reals else "(none)"))
     log.add("unpacked-array types  : " + (", ".join(unpacked) if unpacked else "(none)"))
+    log.add("SV unpacked structs   : " + (", ".join(sv_structs) if sv_structs else "(none)"))
     log.add("supported VHDL types  : " + (", ".join(vhdl) if vhdl else "(none)"))
     return types
 
@@ -943,6 +1067,7 @@ def parse_debug_db(b: bytes, log: Logger) -> DebugDB:
             alloc_flags=a[7],
             object_index_field=a[8],
             port_index=a[10],
+            slice_offset=a[5],
             type_info=type_info,
             dimensions=dims,
             scopes=scopes,
@@ -998,14 +1123,11 @@ def parse_debug_db(b: bytes, log: Logger) -> DebugDB:
     ends: list[int] = []
     for addr in sorted(by_addr):
         objs = by_addr[addr]
-        sizes = {o.expected_payload_bytes for o in objs}
-        realness = {o.is_real for o in objs}
-        widths = {o.bit_width for o in objs}
-        if len(sizes) != 1 or len(realness) != 1 or len(widths) != 1:
-            # Conflicting same-address aliases cannot be waveform-mapped safely.
-            # Preserve the DBG objects, but omit this address from the span index.
+        try:
+            size, _kind, _anchor = _alias_group_metadata(objs, addr)
+        except DecodeError:
+            # Unsupported same-handle view combinations remain fail-closed.
             continue
-        size = next(iter(sizes))
         starts.append(addr)
         ends.append(addr + size)
 
@@ -1430,24 +1552,66 @@ def digital_payload_words(payload: bytes) -> tuple[list[int], list[int]]:
     return avals, bvals
 
 
-def _alias_group_metadata(objs: list[DbgObject], addr: int) -> tuple[int, str]:
+
+def _alias_group_metadata(objs: list[DbgObject], addr: int) -> tuple[int, str, DbgObject]:
+    """Return physical storage metadata for one same-handle DBG alias/view group.
+
+    Whole-object aliases have identical metadata. XSim also gives sliced ports
+    the parent signal's runtime handle: VHDL ports carry a byte offset while
+    Verilog/SystemVerilog packed ports carry a bit offset. The largest object is
+    therefore the storage anchor and smaller objects are validated as views.
+    """
     if not objs:
         raise DecodeError(f"runtime address 0x{addr:X} has no DBG objects")
-    try:
-        sizes = {o.expected_payload_bytes for o in objs}
-    except DecodeError:
-        raise
-    kinds = {o.storage_kind for o in objs}
-    widths = {o.bit_width for o in objs}
-    if len(sizes) != 1 or len(kinds) != 1 or len(widths) != 1:
+
+    candidates: list[tuple[int, int, DbgObject]] = []
+    for o in objs:
+        candidates.append((o.expected_payload_bytes, o.bit_width, o))
+    max_size = max(x[0] for x in candidates)
+    max_width = max(x[1] for x in candidates if x[0] == max_size)
+    anchors = [o for sz, bw, o in candidates if sz == max_size and bw == max_width]
+    anchor = sorted(anchors, key=lambda o: (o.owner, o.index))[0]
+    anchor_kind = anchor.storage_kind
+
+    for o in objs:
+        if o is anchor:
+            continue
+        osize = o.expected_payload_bytes
+        if (
+            osize == max_size
+            and o.bit_width == anchor.bit_width
+            and o.slice_offset == 0
+            and o.storage_kind == anchor_kind
+        ):
+            continue
+
+        lang = o.type_info.language if o.type_info else "unknown"
+        if (
+            lang == "vhdl"
+            and o.storage_kind == anchor_kind
+            and o.slice_offset >= 0
+            and o.slice_offset + osize <= max_size
+        ):
+            continue
+
+        if (
+            lang == "sv"
+            and anchor_kind == "sv_digital"
+            and o.storage_kind == "sv_digital"
+            and o.slice_offset >= 0
+            and o.slice_offset + o.bit_width <= anchor.bit_width
+        ):
+            continue
+
         raise DecodeError(
-            f"runtime address 0x{addr:X} has conflicting alias metadata: "
+            f"runtime address 0x{addr:X} has conflicting alias/view metadata: "
             + ", ".join(
-                f"{o.path}[bits={o.bit_width},raw_width={o.width},type={o.type_code},"
-                f"kind={o.storage_kind}]" for o in objs
+                f"{x.path}[bits={x.bit_width},raw_width={x.width},type={x.type_code},"
+                f"kind={x.storage_kind},offset={x.slice_offset}]" for x in objs
             )
         )
-    return next(iter(sizes)), next(iter(kinds))
+
+    return max_size, anchor_kind, anchor
 
 
 def _span_object_bases(dbg: DebugDB, abs_start: int, payload_bytes: int) -> list[int]:
@@ -1468,7 +1632,7 @@ def _span_object_bases(dbg: DebugDB, abs_start: int, payload_bytes: int) -> list
     matches: list[int] = []
     for base, objs in dbg.objects_by_addr.items():
         try:
-            size, _ = _alias_group_metadata(objs, base)
+            size, _, _anchor = _alias_group_metadata(objs, base)
         except DecodeError:
             continue
         if base <= abs_start and end <= base + size:
@@ -1613,7 +1777,7 @@ def _reconstruct_stream(stream: Stream, wdb: WdbInfo) -> None:
     if stream.payload_bytes <= 0:
         raise DecodeError(f"invalid stream storage size {stream.payload_bytes}")
     kind = stream.storage_kind
-    if kind in {"sv_digital", "sv_unpacked_array"} and stream.payload_bytes % 8:
+    if kind in {"sv_digital", "sv_unpacked_array", "sv_unpacked_struct"} and stream.payload_bytes % 8:
         raise DecodeError(
             f"{kind} allocation 0x{int(stream.absolute_addr or 0):X} has non-aval/bval storage size {stream.payload_bytes}"
         )
@@ -1650,7 +1814,7 @@ def _reconstruct_stream(stream: Stream, wdb: WdbInfo) -> None:
                 f"fragment root={fr.root_index} sid=0x{fr.storage_id:X}/{len(fr.payload)}B "
                 f"falls outside mapped object at 0x{int(stream.absolute_addr or 0):X}"
             )
-        if kind in {"sv_digital", "sv_unpacked_array"} and (off % 8 or len(fr.payload) % 8):
+        if kind in {"sv_digital", "sv_unpacked_array", "sv_unpacked_struct"} and (off % 8 or len(fr.payload) % 8):
             raise DecodeError(
                 f"{kind} fragment offset/size {off}/{len(fr.payload)} at runtime address "
                 f"0x{int(stream.absolute_addr or 0):X} is not aval/bval-word aligned"
@@ -1778,7 +1942,7 @@ def map_roots_to_dbg(wdb: WdbInfo, dbg: DebugDB, wcfg: WcfgInfo | None, log: Log
             )
         obj_addr = starts[0]
         objs = dbg.objects_by_addr[obj_addr]
-        size, _kind = _alias_group_metadata(objs, obj_addr)
+        size, _kind, anchor = _alias_group_metadata(objs, obj_addr)
         stream = stream_map.get(obj_addr)
         if stream is None:
             stream = Stream(
@@ -1788,6 +1952,7 @@ def map_roots_to_dbg(wdb: WdbInfo, dbg: DebugDB, wcfg: WcfgInfo | None, log: Log
                 absolute_addr=obj_addr,
             )
             stream.dbg_objects = sorted(objs, key=lambda o: (o.owner, o.index))
+            stream.storage_object = anchor
             stream_map[obj_addr] = stream
         stream.fragments.append(fr)
 
@@ -1873,6 +2038,10 @@ def canonical_event_payload(stream: Stream, payload: bytes) -> bytes:
                 raise DecodeError("unpacked real-array payload is not a complete sequence of binary64 values")
             return payload
         return _canonical_digital_payload(payload, stream.width)
+    if kind == "sv_unpacked_struct":
+        if len(payload) != stream.payload_bytes or len(payload) % 8:
+            raise DecodeError("SystemVerilog unpacked-struct payload is not complete slot storage")
+        return payload
     if kind == "sv_digital":
         return _canonical_digital_payload(payload, stream.width)
     if kind in {"vhdl_logic", "vhdl_vector"}:
@@ -1891,17 +2060,24 @@ def canonical_event_payload(stream: Stream, payload: bytes) -> bytes:
         if len(payload) != 4:
             raise DecodeError(f"VHDL INTEGER payload is {len(payload)} bytes, expected 4")
         return payload
-    if kind == "vhdl_time":
+    if kind in {"vhdl_time", "vhdl_physical"}:
         if len(payload) != 8:
-            raise DecodeError(f"VHDL TIME payload is {len(payload)} bytes, expected 8")
+            raise DecodeError(f"VHDL physical payload is {len(payload)} bytes, expected 8")
         return payload
     if kind == "vhdl_enum":
-        if len(payload) != 1:
-            raise DecodeError(f"VHDL enumeration payload is {len(payload)} bytes, expected 1")
+        sizes = {o.type_info.enum_storage_bytes for o in stream.dbg_objects if o.type_info}
         counts = {len(o.type_info.enum_literals) for o in stream.dbg_objects if o.type_info}
-        if len(counts) != 1 or next(iter(counts)) <= 0:
-            raise DecodeError("VHDL enumeration aliases disagree on literal table")
-        return _validate_vhdl_enum_bytes(payload, next(iter(counts)) - 1, "vhdl_enum")
+        if len(sizes) != 1 or len(counts) != 1 or next(iter(counts)) <= 0:
+            raise DecodeError("VHDL enumeration aliases disagree on type metadata")
+        esize = next(iter(sizes))
+        if len(payload) != esize:
+            raise DecodeError(
+                f"VHDL enumeration payload is {len(payload)} bytes, expected {esize}"
+            )
+        ordinal = int.from_bytes(payload, "little", signed=False)
+        if ordinal >= next(iter(counts)):
+            raise DecodeError(f"invalid VHDL enumeration ordinal {ordinal}")
+        return payload
     if kind in {"vhdl_record", "vhdl_array"}:
         if len(payload) != stream.payload_bytes:
             raise DecodeError(
@@ -2035,19 +2211,25 @@ def digital_value_text(stream: Stream, payload: bytes) -> str:
         raw = int.from_bytes(payload, "little", signed=False)
         return "b" + format(raw, "032b")
 
-    if kind == "vhdl_time":
+    if kind in {"vhdl_time", "vhdl_physical"}:
         if len(payload) != 8:
-            raise DecodeError("VHDL TIME storage is not 8 bytes")
+            raise DecodeError("VHDL physical storage is not 8 bytes")
         raw = int.from_bytes(payload, "little", signed=False)
         return "b" + format(raw, "064b")
 
     if kind == "vhdl_enum":
-        if len(payload) != 1:
-            raise DecodeError("VHDL enumeration storage is not 1 byte")
+        sizes = {o.type_info.enum_storage_bytes for o in stream.dbg_objects if o.type_info}
         counts = {len(o.type_info.enum_literals) for o in stream.dbg_objects if o.type_info}
-        if len(counts) != 1 or next(iter(counts)) <= 0 or payload[0] >= next(iter(counts)):
+        if len(sizes) != 1 or len(counts) != 1:
+            raise DecodeError("VHDL enumeration aliases disagree on metadata")
+        esize = next(iter(sizes))
+        count = next(iter(counts))
+        if len(payload) != esize:
+            raise DecodeError(f"VHDL enumeration storage is not {esize} byte(s)")
+        ordinal = int.from_bytes(payload, "little", signed=False)
+        if count <= 0 or ordinal >= count:
             raise DecodeError("invalid VHDL enumeration ordinal")
-        return "b" + format(payload[0], f"0{width}b")
+        return "b" + format(ordinal, f"0{width}b")
 
     raise DecodeError(f"storage kind {kind!r} is not a digital waveform representation")
 
@@ -2083,15 +2265,19 @@ def _vhdl_leaf_value(type_info: RttiType, payload: bytes, width: int) -> str | f
         if len(payload) != 4:
             raise DecodeError("VHDL INTEGER leaf is not 4 bytes")
         return format(int.from_bytes(payload, "little", signed=False), "032b")
-    if kind == "vhdl_time":
+    if kind in {"vhdl_time", "vhdl_physical"}:
         if len(payload) != 8:
-            raise DecodeError("VHDL TIME leaf is not 8 bytes")
+            raise DecodeError("VHDL physical leaf is not 8 bytes")
         return format(int.from_bytes(payload, "little", signed=False), "064b")
     if kind == "vhdl_enum":
-        if len(payload) != 1 or not type_info.enum_literals or payload[0] >= len(type_info.enum_literals):
+        esize = type_info.enum_storage_bytes
+        if len(payload) != esize or not type_info.enum_literals:
+            raise DecodeError(f"invalid VHDL enumeration leaf for {type_info.name!r}")
+        ordinal = int.from_bytes(payload, "little", signed=False)
+        if ordinal >= len(type_info.enum_literals):
             raise DecodeError(f"invalid VHDL enumeration leaf for {type_info.name!r}")
         ew = max(1, (len(type_info.enum_literals) - 1).bit_length())
-        return format(payload[0], f"0{ew}b")
+        return format(ordinal, f"0{ew}b")
     raise DecodeError(f"uncharacterized VHDL leaf type {type_info.name!r}/{kind}")
 
 
@@ -2107,7 +2293,7 @@ def _vhdl_leaf_var_type(type_info: RttiType) -> str:
 
 def _vhdl_leaf_signed(type_info: RttiType) -> bool:
     uname = type_info.name.upper()
-    return type_info.kind == "vhdl_integer" or uname in {"SIGNED", "UNRESOLVED_SIGNED"}
+    return type_info.kind in {"vhdl_integer", "vhdl_physical"} or uname in {"SIGNED", "UNRESOLVED_SIGNED"}
 
 
 def _triplet_range_count(r: tuple[int, int, int]) -> int:
@@ -2173,8 +2359,13 @@ def _vhdl_layout_type(
     if kind == "vhdl_enum":
         if not type_info.enum_literals:
             raise DecodeError(f"VHDL enumeration {type_info.name!r} has no literal table")
+        storage = int(type_info.enum_storage_bytes)
+        if storage not in {1, 4}:
+            raise DecodeError(
+                f"VHDL enumeration {type_info.name!r} has unsupported storage size {storage}"
+            )
         width = max(1, (len(type_info.enum_literals) - 1).bit_length())
-        return 1, 1, [VhdlLeafLayout(suffix, type_info, 0, 1, width)], cursor
+        return storage, storage, [VhdlLeafLayout(suffix, type_info, 0, storage, width)], cursor
 
     if kind in {"vhdl_vector", "vhdl_bit_vector"}:
         if cursor >= len(ranges):
@@ -2190,7 +2381,7 @@ def _vhdl_layout_type(
     if kind == "vhdl_integer":
         return 4, 4, [VhdlLeafLayout(suffix, type_info, 0, 4, 32)], cursor
 
-    if kind == "vhdl_time":
+    if kind in {"vhdl_time", "vhdl_physical"}:
         return 8, 8, [VhdlLeafLayout(suffix, type_info, 0, 8, 64)], cursor
 
     if kind == "vhdl_real":
@@ -2215,7 +2406,12 @@ def _vhdl_layout_type(
             actual_ranges = tuple(
                 (r.left, _dbg_range_right(r), r.step) for r in ranges[cur:next_cur]
             )
-            if actual_ranges != field.ranges:
+            expected_ranges = field.ranges
+            ranges_match = len(actual_ranges) == len(expected_ranges) and all(
+                exp == (0, 0, -2) or actual == exp
+                for actual, exp in zip(actual_ranges, expected_ranges)
+            )
+            if not ranges_match:
                 raise DecodeError(
                     f"VHDL record {type_info.name!r} field {field.name!r} DBG ranges "
                     f"{actual_ranges!r} disagree with RTTI {field.ranges!r}"
@@ -2358,6 +2554,320 @@ def _validate_vhdl_aggregate_padding(
                 f"VHDL aggregate {path} has non-zero data in native padding at byte {first}; "
                 "this storage layout is not characterized"
             )
+
+
+
+# ---------------------------------------------------------------------------
+# SystemVerilog unpacked-struct layout
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SvStructLeafLayout:
+    suffix: str
+    type_info: RttiType
+    offset: int
+    payload_bytes: int
+    width: int
+    is_real: bool = False
+    range_left: int | None = None
+    range_right: int | None = None
+
+
+@dataclass(frozen=True)
+class SvStructLayout:
+    size: int
+    leaves: tuple[SvStructLeafLayout, ...]
+
+
+def _concrete_rtti_ranges(
+    field_ranges: tuple[tuple[int, int, int], ...],
+    type_ranges: tuple[tuple[int, int, int], ...],
+) -> tuple[tuple[int, int, int], ...]:
+    candidate = field_ranges if field_ranges else type_ranges
+    return tuple(r for r in candidate if r[2] != -2)
+
+
+def _sv_packed_width(
+    type_info: RttiType,
+    types: list[RttiType],
+    field_ranges: tuple[tuple[int, int, int], ...] = (),
+    stack: tuple[int, ...] = (),
+) -> int:
+    """Return the source packed bit width for one SV field/type."""
+    if type_info.index in stack:
+        raise DecodeError(f"cyclic SystemVerilog packed type at RTTI {type_info.index}")
+    stack = stack + (type_info.index,)
+
+    ranges = _concrete_rtti_ranges(field_ranges, type_info.type_ranges)
+    if ranges:
+        width = 1
+        for r in ranges:
+            count = _rtti_triplet_count(r)
+            if count is None or count <= 0:
+                raise DecodeError(f"non-concrete SystemVerilog range {r!r}")
+            width *= count
+        return width
+
+    if type_info.kind == "sv_real":
+        return 64
+
+    # Packed record: first declared field is the MSB side, and widths simply add.
+    if type_info.layout == 3 and type_info.record_fields:
+        total = 0
+        for f in type_info.record_fields:
+            if f.type_index >= len(types):
+                raise DecodeError(f"SV packed struct field {f.name!r} has invalid type index")
+            total += _sv_packed_width(types[f.type_index], types, f.ranges, stack)
+        if total <= 0:
+            raise DecodeError("zero-width SystemVerilog packed struct")
+        return total
+
+    lname = type_info.name.lower()
+    if lname in {"logic", "bit", "reg"}:
+        return 1
+    if lname in {"byte"}:
+        return 8
+    if lname in {"shortint"}:
+        return 16
+    if lname in {"int", "integer"}:
+        return 32
+    if lname in {"longint", "time"}:
+        return 64
+
+    raise DecodeError(
+        f"cannot derive packed width of SystemVerilog type {type_info.name!r} "
+        f"(RTTI {type_info.index}, kind={type_info.kind})"
+    )
+
+
+def _sv_struct_field_range(
+    type_info: RttiType,
+    field_ranges: tuple[tuple[int, int, int], ...],
+    width: int,
+) -> tuple[int | None, int | None]:
+    ranges = _concrete_rtti_ranges(field_ranges, type_info.type_ranges)
+    if len(ranges) == 1:
+        left, right, step = ranges[0]
+        count = _rtti_triplet_count(ranges[0])
+        if count == width and step in {-1, 1}:
+            return left, right
+    if width > 1:
+        return width - 1, 0
+    return None, None
+
+
+def _sv_unpacked_struct_type_layout(
+    type_info: RttiType,
+    types: list[RttiType],
+    suffix: str = "",
+    stack: tuple[int, ...] = (),
+) -> SvStructLayout:
+    if type_info.kind != "sv_unpacked_struct" or type_info.layout != 2 or not type_info.record_fields:
+        raise DecodeError(
+            f"type {type_info.name!r}/{type_info.index} is not a characterized unpacked SV struct"
+        )
+    if type_info.index in stack:
+        raise DecodeError(f"cyclic SystemVerilog unpacked struct at RTTI {type_info.index}")
+    stack = stack + (type_info.index,)
+
+    # First determine each field's native slot size and declaration-order leaves.
+    specs: list[tuple[int, list[SvStructLeafLayout]]] = []
+    for f in type_info.record_fields:
+        if f.type_index >= len(types):
+            raise DecodeError(f"SV struct field {f.name!r} has invalid type index {f.type_index}")
+        child = types[f.type_index]
+        fsuffix = suffix + "." + f.name
+
+        if child.kind == "sv_unpacked_struct":
+            nested = _sv_unpacked_struct_type_layout(child, types, fsuffix, stack)
+            specs.append((nested.size, list(nested.leaves)))
+            continue
+
+        if child.kind == "sv_real":
+            specs.append((
+                8,
+                [SvStructLeafLayout(fsuffix, child, 0, 8, 64, True, None, None)],
+            ))
+            continue
+
+        # Arrays of unpacked structs inside a struct require recursive element
+        # slotting and are not enabled until directly characterized.
+        if child.kind == "sv_unpacked_array":
+            leaf = child
+            seen: set[int] = set()
+            while leaf.kind == "sv_unpacked_array":
+                if leaf.index in seen or leaf.element_type_index is None or leaf.element_type_index >= len(types):
+                    raise DecodeError(f"invalid SV unpacked-array field type at RTTI {leaf.index}")
+                seen.add(leaf.index)
+                leaf = types[leaf.element_type_index]
+            if leaf.kind == "sv_unpacked_struct":
+                raise DecodeError(
+                    f"unpacked array of unpacked structs inside field {fsuffix} is not characterized"
+                )
+
+        width = _sv_packed_width(child, types, f.ranges, stack)
+        pbytes = 8 * max(1, (width + 31) // 32)
+        left, right = _sv_struct_field_range(child, f.ranges, width)
+        specs.append((
+            pbytes,
+            [SvStructLeafLayout(fsuffix, child, 0, pbytes, width, False, left, right)],
+        ))
+
+    # XSim gives each unpacked field whole 32-bit aval/bval slots and places the
+    # last declared field at the lowest address.
+    base_by_index: dict[int, int] = {}
+    cursor = 0
+    for i in range(len(specs) - 1, -1, -1):
+        base_by_index[i] = cursor
+        cursor += specs[i][0]
+
+    leaves: list[SvStructLeafLayout] = []
+    for i, (_size, field_leaves) in enumerate(specs):
+        base = base_by_index[i]
+        for leaf in field_leaves:
+            leaves.append(SvStructLeafLayout(
+                leaf.suffix,
+                leaf.type_info,
+                base + leaf.offset,
+                leaf.payload_bytes,
+                leaf.width,
+                leaf.is_real,
+                leaf.range_left,
+                leaf.range_right,
+            ))
+    return SvStructLayout(cursor, tuple(leaves))
+
+
+def _sv_unpacked_object_layout(obj: DbgObject, types: list[RttiType]) -> SvStructLayout:
+    if obj.type_info is None:
+        raise DecodeError(f"{obj.path} has no RTTI type")
+
+    if obj.type_info.kind == "sv_unpacked_struct":
+        layout = _sv_unpacked_struct_type_layout(obj.type_info, types)
+        if layout.size != obj.expected_payload_bytes:
+            raise DecodeError(
+                f"SV unpacked struct {obj.path} derives {layout.size}B but allocation needs "
+                f"{obj.expected_payload_bytes}B"
+            )
+        return layout
+
+    if obj.is_unpacked_array and obj.sv_leaf_type and obj.sv_leaf_type.kind == "sv_unpacked_struct":
+        rank = obj.sv_unpacked_rank
+        if rank <= 0 or len(obj.dimensions) < rank:
+            raise DecodeError(f"SV unpacked struct array {obj.path} has inconsistent dimensions")
+        if len(obj.dimensions) != rank:
+            raise DecodeError(
+                f"SV unpacked struct array {obj.path} has uncharacterized packed dimensions"
+            )
+        tuples: list[tuple[int, ...]] = [()]
+        for d in obj.dimensions[:rank]:
+            tuples = [prefix + (idx,) for prefix in tuples for idx in d.indices()]
+        if not tuples:
+            raise DecodeError(f"SV unpacked struct array {obj.path} is empty")
+
+        elem = _sv_unpacked_struct_type_layout(obj.sv_leaf_type, types)
+        total = elem.size * len(tuples)
+        if total != obj.expected_payload_bytes:
+            raise DecodeError(
+                f"SV unpacked struct array {obj.path} derives {total}B but allocation needs "
+                f"{obj.expected_payload_bytes}B"
+            )
+
+        leaves: list[SvStructLeafLayout] = []
+        for pos, idx_tuple in enumerate(tuples):
+            # Unpacked array storage is last-declared element at the low address.
+            storage_pos = len(tuples) - 1 - pos
+            base = storage_pos * elem.size
+            idx_suffix = "".join(f"[{idx}]" for idx in idx_tuple)
+            for leaf in elem.leaves:
+                leaves.append(SvStructLeafLayout(
+                    idx_suffix + leaf.suffix,
+                    leaf.type_info,
+                    base + leaf.offset,
+                    leaf.payload_bytes,
+                    leaf.width,
+                    leaf.is_real,
+                    leaf.range_left,
+                    leaf.range_right,
+                ))
+        return SvStructLayout(total, tuple(leaves))
+
+    raise DecodeError(f"{obj.path} is not an SV unpacked-struct waveform")
+
+
+def _sv_struct_layout_signature(layout: SvStructLayout) -> tuple[Any, ...]:
+    return (
+        layout.size,
+        tuple(
+            (
+                leaf.suffix, leaf.type_info.kind, leaf.type_info.layout,
+                leaf.offset, leaf.payload_bytes, leaf.width, leaf.is_real,
+                leaf.range_left, leaf.range_right,
+            )
+            for leaf in layout.leaves
+        ),
+    )
+
+
+def _sv_digital_slot_value(payload: bytes, width: int) -> str:
+    canonical = _canonical_digital_payload(payload, width)
+    avals, bvals = digital_payload_words(canonical)
+    aval = 0
+    bval = 0
+    for i, (a, b) in enumerate(zip(avals, bvals)):
+        aval |= a << (32 * i)
+        bval |= b << (32 * i)
+    if width == 1:
+        a = aval & 1
+        b = bval & 1
+        return "x" if a and b else "z" if b else "1" if a else "0"
+    chars: list[str] = []
+    for bit in range(width - 1, -1, -1):
+        a = (aval >> bit) & 1
+        b = (bval >> bit) & 1
+        chars.append("x" if a and b else "z" if b else "1" if a else "0")
+    return "".join(chars)
+
+
+def _sv_leaf_var_type(leaf: SvStructLeafLayout) -> str:
+    if leaf.is_real:
+        return "real"
+    if leaf.type_info.name.lower() in {"int", "integer"} and leaf.width == 32:
+        return "integer"
+    return "reg"
+
+
+def _sv_leaf_signed(leaf: SvStructLeafLayout) -> bool:
+    return leaf.type_info.name.lower() in {"byte", "shortint", "int", "integer", "longint"}
+
+
+def _sv_digital_view_value(
+    payload: bytes, storage_width: int, bit_offset: int, view_width: int
+) -> str:
+    if bit_offset < 0 or view_width <= 0 or bit_offset + view_width > storage_width:
+        raise DecodeError(
+            f"invalid SystemVerilog packed view offset={bit_offset} width={view_width} "
+            f"inside {storage_width} bits"
+        )
+    canonical = _canonical_digital_payload(payload, storage_width)
+    avals, bvals = digital_payload_words(canonical)
+    aval = 0
+    bval = 0
+    for i, (a, b) in enumerate(zip(avals, bvals)):
+        aval |= a << (32 * i)
+        bval |= b << (32 * i)
+    mask = (1 << view_width) - 1
+    aval = (aval >> bit_offset) & mask
+    bval = (bval >> bit_offset) & mask
+    if view_width == 1:
+        return "x" if aval and bval else "z" if bval else "1" if aval else "0"
+    chars: list[str] = []
+    for bit in range(view_width - 1, -1, -1):
+        a = (aval >> bit) & 1
+        b = (bval >> bit) & 1
+        chars.append("x" if a and b else "z" if b else "1" if a else "0")
+    return "".join(chars)
+
 
 
 # ===========================================================================
@@ -2891,6 +3401,106 @@ def load_wdb(inputs: list[Path], explicit_wcfg: Path | None = None) -> Waveform:
                             default_selected.add(display_name)
                 continue
 
+            # SystemVerilog unpacked structs use one or more 32-bit aval/bval
+            # slots per field, with the last declared field at the lowest
+            # address. Arrays of unpacked structs repeat that slot layout with
+            # the last array element lowest. Expose fields as semantic leaves.
+            sv_struct_objs = [
+                o for o in s.dbg_objects
+                if (
+                    o.type_info and o.type_info.kind == "sv_unpacked_struct"
+                ) or (
+                    o.is_unpacked_array
+                    and o.sv_leaf_type is not None
+                    and o.sv_leaf_type.kind == "sv_unpacked_struct"
+                )
+            ]
+            if sv_struct_objs:
+                if len(sv_struct_objs) != len(s.dbg_objects):
+                    raise ConversionError(
+                        f"runtime address 0x{int(s.absolute_addr or 0):X} mixes SV unpacked-struct "
+                        "and non-struct aliases"
+                    )
+                try:
+                    layouts = [_sv_unpacked_object_layout(o, dbg.rtti_types) for o in sv_struct_objs]
+                except DecodeError as exc:
+                    raise ConversionError(str(exc)) from exc
+                signatures = [_sv_struct_layout_signature(layout) for layout in layouts]
+                if any(sig != signatures[0] for sig in signatures[1:]):
+                    raise ConversionError(
+                        f"runtime address 0x{int(s.absolute_addr or 0):X} has SV unpacked-struct "
+                        "aliases with different recursive layouts"
+                    )
+                layout = layouts[0]
+                if layout.size != s.payload_bytes:
+                    raise ConversionError(
+                        f"SV unpacked struct at 0x{int(s.absolute_addr or 0):X} derives {layout.size}B "
+                        f"but runtime allocation is {s.payload_bytes}B"
+                    )
+
+                for li, leaf in enumerate(layout.leaves):
+                    leaf_sk = f"{base_sk}:sv_struct_leaf:{li}"
+                    if leaf.is_real:
+                        leaf_changes = [
+                            Change(
+                                e.time,
+                                struct.unpack_from(
+                                    "<d",
+                                    e.payload[leaf.offset:leaf.offset + leaf.payload_bytes],
+                                    0,
+                                )[0],
+                            )
+                            for e in s.events
+                        ]
+                    else:
+                        leaf_changes = [
+                            Change(
+                                e.time,
+                                _sv_digital_slot_value(
+                                    e.payload[leaf.offset:leaf.offset + leaf.payload_bytes],
+                                    leaf.width,
+                                ),
+                            )
+                            for e in s.events
+                        ]
+                    leaf_changes = collapse_changes(leaf_changes)
+                    leaf_stream = StreamInfo(leaf_sk, leaf_changes, [])
+                    streams[leaf_sk] = leaf_stream
+
+                    for oi, obj in enumerate(s.dbg_objects):
+                        parent_cp = canonical_path(obj.path)
+                        cp = canonical_path(obj.path + leaf.suffix)
+                        generated_paths.add(parent_cp)
+                        generated_paths.add(cp)
+                        wcfg_sig = style_map.get(cp) or style_map.get(parent_cp)
+                        key = f"{leaf_sk}:{oi}"
+                        display_name = display_name_from_path(cp)
+                        sig = SignalInfo(
+                            key=key,
+                            name=display_name,
+                            hdl_path=cp,
+                            scopes=obj.scopes,
+                            ref_name=obj.name + leaf.suffix,
+                            width=leaf.width,
+                            var_type=_sv_leaf_var_type(leaf),
+                            stream_key=leaf_sk,
+                            is_real=leaf.is_real,
+                            signed=_sv_leaf_signed(leaf),
+                            style=wcfg_sig.style if wcfg_sig else None,
+                            color=wcfg_sig.color if wcfg_sig else None,
+                            wcfg_radix=wcfg_sig.radix if wcfg_sig else None,
+                            range_left=leaf.range_left,
+                            range_right=leaf.range_right,
+                        )
+                        signals[key] = sig
+                        signal_order.append(key)
+                        leaf_stream.signal_keys.append(key)
+                        if default_selected is not None and (
+                            cp in wcfg_selected or parent_cp in wcfg_selected
+                        ):
+                            default_selected.add(display_name)
+                continue
+
             # All aliases at one runtime allocation have already been checked
             # for identical storage metadata.  Unpacked arrays are expanded to
             # leaf elements using the recursive RTTI array chain, not by guessing
@@ -2987,6 +3597,122 @@ def load_wdb(inputs: list[Path], explicit_wcfg: Path | None = None) -> Waveform:
                         estream.signal_keys.append(key)
                         if default_selected is not None and (cp in wcfg_selected or parent_cp in wcfg_selected):
                             default_selected.add(display_name)
+                continue
+
+            # Same-handle sliced ports are views into the anchor allocation,
+            # not whole-object aliases. VHDL reports the offset in native bytes;
+            # Verilog/SystemVerilog reports it in packed bits from bit zero.
+            has_views = any(
+                o.expected_payload_bytes != s.payload_bytes
+                or o.bit_width != s.width
+                or o.slice_offset != 0
+                for o in s.dbg_objects
+            )
+            if has_views:
+                for oi, obj in enumerate(s.dbg_objects):
+                    obj_sk = f"{base_sk}:view:{oi}"
+                    lang = obj.type_info.language if obj.type_info else "unknown"
+                    whole = (
+                        obj.expected_payload_bytes == s.payload_bytes
+                        and obj.bit_width == s.width
+                        and obj.slice_offset == 0
+                        and obj.storage_kind == s.storage_kind
+                    )
+
+                    if whole:
+                        if s.is_real:
+                            obj_changes = [
+                                Change(e.time, struct.unpack("<d", e.payload)[0])
+                                for e in s.events
+                            ]
+                        else:
+                            obj_changes = [
+                                Change(
+                                    e.time,
+                                    (lambda txt: txt[1:] if txt.startswith("b") else txt)(
+                                        digital_value_text(s, e.payload)
+                                    ),
+                                )
+                                for e in s.events
+                            ]
+                    elif lang == "vhdl":
+                        start_b = obj.slice_offset
+                        end_b = start_b + obj.expected_payload_bytes
+                        if end_b > s.payload_bytes:
+                            raise ConversionError(
+                                f"VHDL view {obj.path} lies outside runtime allocation "
+                                f"0x{int(s.absolute_addr or 0):X}"
+                            )
+                        obj_changes = [
+                            Change(
+                                e.time,
+                                _vhdl_leaf_value(
+                                    obj.type_info,
+                                    e.payload[start_b:end_b],
+                                    obj.bit_width,
+                                ),
+                            )
+                            for e in s.events
+                        ]
+                    elif (
+                        lang == "sv"
+                        and s.storage_kind == "sv_digital"
+                        and obj.storage_kind == "sv_digital"
+                    ):
+                        obj_changes = [
+                            Change(
+                                e.time,
+                                _sv_digital_view_value(
+                                    e.payload, s.width, obj.slice_offset, obj.bit_width
+                                ),
+                            )
+                            for e in s.events
+                        ]
+                    else:
+                        raise ConversionError(
+                            f"same-handle view {obj.path} has an uncharacterized storage form"
+                        )
+
+                    obj_stream = StreamInfo(obj_sk, collapse_changes(obj_changes), [])
+                    streams[obj_sk] = obj_stream
+                    cp = canonical_path(obj.path)
+                    generated_paths.add(cp)
+                    wcfg_sig = style_map.get(cp)
+                    key = f"{obj_sk}:0"
+                    display_name = display_name_from_path(obj.path)
+                    sig = SignalInfo(
+                        key=key,
+                        name=display_name,
+                        hdl_path=cp,
+                        scopes=obj.scopes,
+                        ref_name=obj.name,
+                        width=obj.bit_width,
+                        var_type=obj.vcd_var_type,
+                        stream_key=obj_sk,
+                        is_real=obj.is_real,
+                        signed=obj.is_signed,
+                        style=wcfg_sig.style if wcfg_sig else None,
+                        color=wcfg_sig.color if wcfg_sig else None,
+                        wcfg_radix=wcfg_sig.radix if wcfg_sig else None,
+                        range_left=(
+                            obj.dimensions[0].left
+                            if len(obj.dimensions) == 1
+                            and obj.dimensions[0].count == obj.bit_width
+                            else None
+                        ),
+                        range_right=(
+                            obj.dimensions[0].left
+                            + obj.dimensions[0].step * (obj.dimensions[0].count - 1)
+                            if len(obj.dimensions) == 1
+                            and obj.dimensions[0].count == obj.bit_width
+                            else None
+                        ),
+                    )
+                    signals[key] = sig
+                    signal_order.append(key)
+                    obj_stream.signal_keys.append(key)
+                    if default_selected is not None and cp in wcfg_selected:
+                        default_selected.add(display_name)
                 continue
 
             if s.is_real:
